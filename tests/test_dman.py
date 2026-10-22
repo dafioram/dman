@@ -3,6 +3,7 @@
 Run from the package folder:  python3 -m unittest discover -s tests -v
 """
 import configparser
+import io
 import os
 import sys
 import tempfile
@@ -75,7 +76,7 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(dman.parse_selection("1 3-4,2", 5), [0, 1, 2, 3])
         self.assertEqual(dman.parse_selection("all", 3), [0, 1, 2])
         self.assertEqual(dman.parse_selection("4-2", 5), [1, 2, 3])
-        for bad in ["", "0", "6", "1-9", "x", "1 two"]:
+        for bad in ["", "0", "6", "1-9", "x", "1 two", "\u00b2", "1 \u00b3"]:
             self.assertIsNone(dman.parse_selection(bad, 5), bad)
 
     def test_dotenv(self):
@@ -118,6 +119,13 @@ class ConfigTests(unittest.TestCase):
         cfg = dman.parse_config(cp, "x", warnings)
         self.assertEqual(cfg.depth, dman.DEFAULT_DEPTH)
         self.assertEqual(len(warnings), 2)
+
+    def test_non_ascii_digits_warn(self):
+        cp = configparser.ConfigParser()
+        cp.read_string("[projects]\ndepth = \u00b2\n[ui]\npage_size = \u00b9\n")
+        warnings = []
+        cfg = dman.parse_config(cp, "x", warnings)
+        self.assertEqual((cfg.depth, cfg.page_size, len(warnings)), (dman.DEFAULT_DEPTH, None, 2))
 
     def test_missing_explicit_file(self):
         cfg = dman.load_config("/nonexistent/dman.conf")
@@ -283,6 +291,35 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(dman.fit("abcdef", 4), "abc~")
         self.assertEqual(dman.fit("abc", 4), "abc")
         self.assertEqual(dman.fit("abc", 0), "")
+
+
+class OutputSafetyTests(unittest.TestCase):
+    def test_strip_controls(self):
+        hostile = ("a\x1b]52;c;aGk=\x07b"      # OSC 52 clipboard write
+                   "\x1b]0;title\x1b\\c"        # window title
+                   "\x1b[5A\x1b[2Jd\x1b[8m"      # cursor up, clear, conceal
+                   "\x9b31m\re\x00f")           # C1 CSI, carriage return, NUL
+        out = dman.strip_controls(hostile)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\x9b", out)
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\x07", out)
+        self.assertEqual(dman.strip_controls("x\ty\nz \u2026 \u00e9"), "x\ty\nz \u2026 \u00e9")
+
+    def test_own_styles_pass(self):
+        dman.Style.enabled = True
+        try:
+            styled = dman.c("ok", "bold", "red") + dman.c("x", "dim")
+        finally:
+            dman.Style.enabled = False
+        self.assertEqual(dman.strip_controls(styled), styled)
+
+    def test_safe_output(self):
+        buf = io.StringIO()
+        out = dman.SafeOutput(buf)
+        print("name\x1b]0;pwned\x07!", file=out)
+        self.assertEqual(buf.getvalue(), "name]0;pwned!\n")
+        self.assertEqual(out.getvalue(), buf.getvalue())
 
 
 class ContainerTests(unittest.TestCase):
