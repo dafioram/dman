@@ -299,6 +299,65 @@ class LogTests(unittest.TestCase):
             self.assertFalse(dman.LOG_SINCE_RE.fullmatch(bad), bad)
 
 
+class NavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.answers = []
+        self.real_ask, self.real_clear = dman.ask, dman.clear
+        dman.ask = lambda prompt, on_interrupt="b": self.answers.pop(0)
+        dman.clear = lambda: None
+        self.out = io.StringIO()
+        self.real_stdout, sys.stdout = sys.stdout, self.out
+
+    def tearDown(self):
+        dman.ask, dman.clear, sys.stdout = self.real_ask, self.real_clear, self.real_stdout
+
+    def test_menu_keys(self):
+        opts = [("1", "One", "")]
+        self.answers = ["1", "M", "m", "q"]
+        self.assertEqual(dman.menu([], opts), "1")
+        with self.assertRaises(dman.ToMainMenu):
+            dman.menu([], opts)
+        self.assertEqual(dman.menu([], opts, top=True), "m")
+        with self.assertRaises(dman.QuitApp):
+            dman.menu([], opts)
+        self.assertIn("m main menu", self.out.getvalue())
+
+    def test_list_m_goes_to_main_menu(self):
+        view = dman.ListView("Things", lambda: (["a", "b"], None), [dman.Col("NAME", str)])
+        self.answers = ["m"]
+        with self.assertRaises(dman.ToMainMenu):
+            view.run()
+        self.assertIn("m main menu", self.out.getvalue())
+
+    def test_main_menu_catches_m_from_nested_screens(self):
+        def nested():
+            dman.menu(["inner"], [("1", "x", "")])      # a screen several levels down
+        real = dman.projects_screen, dman.docker
+        dman.projects_screen = nested
+        dman.docker = lambda *a, **k: dman.Result(0, "running\tUp 1 minute\n", "")
+        try:
+            self.answers = ["1", "m", "q"]                # open screen 1, m inside it, then q
+            with self.assertRaises(dman.QuitApp):
+                dman.main_menu()
+        finally:
+            dman.projects_screen, dman.docker = real
+        self.assertEqual(self.out.getvalue().count("Docker on this host"), 2)
+
+    def test_key_hints_wrap(self):
+        keys = ["1-11 open", "s sort", "f filter", "Enter refresh", "h help", "b back", "m main menu", "q quit"]
+        real = dman.term_size
+        try:
+            dman.term_size = lambda: (80, 24)
+            lines = dman.key_hints(keys).split("\n")
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(all(len(x) < 80 for x in lines))
+            self.assertEqual(" · ".join(lines), " · ".join(keys))
+            dman.term_size = lambda: (200, 24)
+            self.assertEqual(dman.key_hints(keys), " · ".join(keys))
+        finally:
+            dman.term_size = real
+
+
 class LayoutTests(unittest.TestCase):
     def test_columns_fit_and_drop(self):
         cols = [dman.Col("NAME", str, max=30, min=6, flex=True, want=12),

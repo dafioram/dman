@@ -78,9 +78,10 @@ Main menu:
 7. **System info**: versions, the Docker endpoint, the config file and project folders.
 
 Keys in lists: a number opens an item, `n`/`p` page, `s` sort, `f` filter, Enter
-refreshes, `h` help, `b` back, `q` quit. Ctrl-C at a prompt goes back; Ctrl-C while a
-command runs (logs, up, a shell) stops that command and returns to dman. Long output
-opens in `less` (`q` closes it).
+refreshes, `h` help, `b` back, `m` main menu, `q` quit. `b`, `m` and `q` work in every
+menu and list. Ctrl-C at a prompt goes back; Ctrl-C while a command runs (logs, up, a
+shell) stops that command and returns to dman. Long output opens in `less` (`q` closes
+it).
 
 ## Configuration
 
