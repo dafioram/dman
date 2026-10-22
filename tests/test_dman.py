@@ -271,6 +271,15 @@ class EndpointTests(unittest.TestCase):
         self.assertIsNotNone(self.check({}, self.runner(host="")).problem)
 
 
+class ProjectWorkflowTests(unittest.TestCase):
+    def test_service_names_without_files(self):
+        cts = [make_container("p-web-1", labels={dman.L_PROJECT: "p", dman.L_SERVICE: "web"}),
+               make_container("p-db-1", labels={dman.L_PROJECT: "p", dman.L_SERVICE: "db"})]
+        p = dman.Project(key="project:p", name="p", name_known=True, directory=None, folder_files=[],
+                         files=None, files_how="", containers=cts)
+        self.assertEqual(dman.service_names(p), (["db", "web"], None))
+
+
 class LogTests(unittest.TestCase):
     def test_options(self):
         self.assertEqual(dman.log_options("100"), ["--tail", "100"])
