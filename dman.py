@@ -145,6 +145,21 @@ class QuitApp(Exception):
     """Raised anywhere to leave dman cleanly."""
 
 
+class ToMainMenu(Exception):
+    """Raised from any menu or list (key m) to go straight back to the main menu."""
+
+
+def key_hints(keys: Sequence[str]) -> str:
+    """'1-9 open · b back · ...' wrapped between items to the terminal width."""
+    cols, _ = term_size()
+    lines = [""]
+    for k in keys:
+        if lines[-1] and len(lines[-1]) + 3 + len(k) > cols - 1:
+            lines.append("")
+        lines[-1] += (" · " if lines[-1] else "") + k
+    return "\n".join(lines)
+
+
 def ask(prompt: str, on_interrupt: str = "b") -> str:
     """Read a line. Ctrl-C returns `on_interrupt`; Ctrl-D quits dman."""
     try:
@@ -1203,8 +1218,8 @@ class ListView:
                 keys.append("%s %s" % (k, label))
             if self.auto_refresh:
                 keys.append("a auto-refresh")
-            keys += ["Enter refresh", "h help", "b back", "q quit"]
-            print(c(" · ".join(keys), "dim"))
+            keys += ["Enter refresh", "h help", "b back", "m main menu", "q quit"]
+            print(c(key_hints(keys), "dim"))
         return page_items
 
     def run(self) -> None:
@@ -1243,6 +1258,8 @@ class ListView:
                 return
             elif low == "q":
                 raise QuitApp()
+            elif low == "m":
+                raise ToMainMenu()
             else:
                 self.message = c("Unknown key: %s" % key, "yellow")
 
@@ -1265,8 +1282,10 @@ class ListView:
             pass
 
 
-def menu(header: Sequence[str], options: Sequence[Tuple[str, str, str]], message: Optional[str] = None) -> str:
-    """Show a header and numbered options (key, label, style). Returns the key typed."""
+def menu(header: Sequence[str], options: Sequence[Tuple[str, str, str]], message: Optional[str] = None,
+         top: bool = False) -> str:
+    """Show a header and numbered options (key, label, style). Returns the key typed.
+    q quits and, except on the main menu itself (top), m goes to the main menu."""
     clear()
     for line in header:
         print(line)
@@ -1286,13 +1305,15 @@ def menu(header: Sequence[str], options: Sequence[Tuple[str, str, str]], message
                 text = fit(cells[i], cols - 1) if ncols == 1 else cells[i].ljust(col_w)
                 line += c(text, styles[i]) if styles[i] else text
         print(line.rstrip())
-    print(c("b back · q quit", "dim"))
+    print(c("b back · q quit" if top else "b back · m main menu · q quit", "dim"))
     if message:
         print()
         print(message)
     key = ask("> ").lower()
     if key == "q":
         raise QuitApp()
+    if key == "m" and not top:
+        raise ToMainMenu()
     return key
 
 
@@ -1322,13 +1343,15 @@ def show_env(title: str, sections: Sequence[Tuple[str, List[Tuple[str, str]]]], 
             for line in redacted_lines(pairs, reveal):
                 print("  " + line)
         print()
-        key = ask(c("r reveal values · Enter/b back > " if not reveal else "Enter/b back > ", "dim")).lower()
+        key = ask(c(("r reveal values · " if not reveal else "") + "Enter/b back · m main menu > ", "dim")).lower()
         if key == "r" and not reveal:
             print(c("Values may include passwords and tokens. They will appear in this terminal "
                     "and its scrollback (and any session recording).", "yellow"))
             reveal = confirm("Reveal values?")
         elif key == "q":
             raise QuitApp()
+        elif key == "m":
+            raise ToMainMenu()
         else:
             return
 
@@ -2654,6 +2677,7 @@ LIST_HELP = """Lists
   n / p     next / previous page
   s         choose how to sort        f   filter (words; all must match)
   Enter     refresh                   b   back      q   quit dman
+  m         main menu
 Ctrl-C at a prompt goes back. Item numbers are only valid for the page shown;
 dman re-checks the real container/image/volume before acting on it."""
 
@@ -2742,8 +2766,9 @@ Main menu
   6 Disk & cleanup     docker system df and reviewed cleanup (never volumes)
   7 System info        versions, endpoint, config in use
 
-Everywhere: Enter refreshes, b goes back, q quits, h shows help, Ctrl-C at a
-prompt goes back, and Ctrl-C stops a running command (logs, up, ...).
+Everywhere: Enter refreshes, b goes back, m returns to this main menu, q quits,
+h shows help, Ctrl-C at a prompt goes back, and Ctrl-C stops a running command
+(logs, up, ...).
 
 Configuration
   First found of: --config FILE, $DMAN_CONFIG, ~/.config/dman/dman.conf,
@@ -2808,19 +2833,21 @@ def main_menu() -> None:
         key = menu([c("dman", "bold", "cyan") + summary],
                    [("1", "Compose projects", ""), ("2", "Containers", ""), ("3", "Live resource usage", ""),
                     ("4", "Images", ""), ("5", "Volumes & mounts", ""), ("6", "Disk usage & cleanup", ""),
-                    ("7", "System info", ""), ("h", "Help", "")], message)
+                    ("7", "System info", ""), ("h", "Help", "")], message, top=True)
         message = None
         if key in screens:
             try:
                 screens[key]()
             except KeyboardInterrupt:
                 message = c("Interrupted.", "yellow")
+            except ToMainMenu:
+                pass
         elif key == "h":
             show_text(MAIN_HELP, "dman help")
         elif key == "b":
             if confirm("Quit dman?", default=True):
                 return
-        elif key:
+        elif key and key != "m":
             message = c("Unknown choice: %s" % key, "yellow")
 
 
