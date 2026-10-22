@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+
+  integration:
+    name: Integration tests (real Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker version && docker compose version
+      - run: python3 -m unittest discover -s tests -v
+        env:
+          DMAN_INTEGRATION: "1"
+
+  install:
+    name: Install / uninstall scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck
+        run: shellcheck --severity=warning install.sh uninstall.sh
+      - name: Install, reinstall, uninstall into a temporary prefix
+        run: |
+          root="$(mktemp -d)"
+          export DMAN_PREFIX="$root/usr" DMAN_CONF_DIR="$root/etc"
+          ./install.sh --yes </dev/null
+          test "$("$DMAN_PREFIX/bin/dman" --version)" = "dman $(cat VERSION)"
+          grep -q '^    /opt/docker$' "$DMAN_CONF_DIR/dman.conf"
+          ./install.sh --yes </dev/null
+          ./uninstall.sh --yes --purge
+          test ! -e "$DMAN_PREFIX/bin/dman" && test ! -e "$DMAN_PREFIX/lib/dman" && test ! -e "$DMAN_CONF_DIR/dman.conf"
+      - name: Installer refuses to overwrite files it did not create
+        run: |
+          root="$(mktemp -d)"
+          export DMAN_PREFIX="$root/usr" DMAN_CONF_DIR="$root/etc"
+          mkdir -p "$DMAN_PREFIX/bin" && echo 'not dman' > "$DMAN_PREFIX/bin/dman"
+          if ./install.sh --yes </dev/null; then echo "install.sh overwrote a foreign file"; exit 1; fi
+          test "$(cat "$DMAN_PREFIX/bin/dman")" = "not dman"
