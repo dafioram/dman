@@ -60,8 +60,10 @@ Main menu:
    Docker knows about from container labels. Status, Up, Up with build, Pull & up,
    Restart, Stop, Start, Logs, Down, Down + remove volumes, the containers of the
    project, the compose file(s), the resolved config and the environment.
-2. **Containers**: all containers with state, health, published ports, project and age.
-   Logs (last 100 / 500 / all / custom, or follow live), start/stop/restart, a shell
+2. **Containers**: all containers with state, health, restart count, published ports,
+   project and age. A running container that its restart policy keeps restarting is
+   shown in yellow. Logs (last 100 / 500 / all / custom, since a time such as `15m` or
+   `2026-10-22`, or follow live; `t` toggles timestamps), start/stop/restart, a shell
    (bash, falling back to sh), one-off commands, details, environment, mounts, removal.
 3. **Live resource usage**: CPU, memory, network and disk I/O now; `a` auto-refreshes.
 4. **Images**: size, age, which containers use each one; pull and remove.
