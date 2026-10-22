@@ -518,6 +518,7 @@ class Container:
     env: List[str]
     restart: str
     networks: List[str]
+    restart_count: int = 0           # restarts by the restart policy since the last manual start
     raw: Dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property
@@ -546,6 +547,8 @@ class Container:
             text += " (%d)" % self.exit_code
         if self.health:
             text += " " + self.health
+        if self.restart_count:
+            text += " (%d restart%s)" % (self.restart_count, "" if self.restart_count == 1 else "s")
         return text
 
     def since(self) -> str:
@@ -604,6 +607,7 @@ def container_from_inspect(d: Dict[str, Any]) -> Container:
         env=cfg.get("Env") or [],
         restart=(host.get("RestartPolicy") or {}).get("Name") or "no",
         networks=sorted((net.get("Networks") or {}).keys()),
+        restart_count=int(d.get("RestartCount") or 0),
         raw=d,
     )
 
@@ -1363,7 +1367,7 @@ def state_style(ct: Container) -> Sequence[str]:
     if ct.health == "unhealthy" or ct.state in ("dead", "restarting"):
         return ("red",)
     if ct.running:
-        return ("green",)
+        return ("yellow",) if ct.restart_count else ("green",)
     if ct.state == "paused":
         return ("yellow",)
     return ("dim",)
@@ -1449,8 +1453,7 @@ def container_view(cid: str) -> None:
             message = c("Not available here: %s" % key, "yellow")
             continue
         if key == "1":
-            logs_menu("Logs: " + ct.label(), lambda tail, follow: ["docker", "logs"] +
-                      (["-f"] if follow else []) + (["--tail", tail] if tail else []) + [ct.id])
+            logs_menu("Logs: " + ct.label(), lambda opts: ["docker", "logs"] + opts + [ct.id])
         elif key == "2":
             message = simple_action(["start", ct.id], "Starting " + ct.label())
         elif key == "3":
@@ -1494,26 +1497,53 @@ def simple_action(args: List[str], doing: str, timeout: float = 60) -> str:
     return c("Done.", "green") if r.ok else c("Failed: " + r.message(), "red")
 
 
-def logs_menu(title: str, build: Callable[[Optional[str], bool], List[str]], cwd: Optional[str] = None) -> None:
+LOG_SINCE_RE = re.compile(r"(\d+(\.\d+)?(ns|us|ms|s|m|h))+|\d{4}-\d\d-\d\d([T ]\d\d:\d\d(:\d\d)?)?\S*|\d{9,}")
+
+
+def log_options(tail: Optional[str] = None, follow: bool = False, since: Optional[str] = None,
+                timestamps: bool = False) -> List[str]:
+    """Options shared by `docker logs` and `docker compose logs`."""
+    return ((["-f"] if follow else []) + (["-t"] if timestamps else [])
+            + (["--since", since] if since else []) + (["--tail", tail] if tail else []))
+
+
+def logs_menu(title: str, build: Callable[[List[str]], List[str]], cwd: Optional[str] = None) -> None:
+    """`build` turns log options into the full command."""
+    timestamps = False
+    message = None
     while True:
         key = menu([c(title, "bold", "cyan"),
                     c("What is kept depends on the Docker logging driver and its rotation settings.", "dim")],
                    [("1", "Last 100 lines", ""), ("2", "Last 500 lines", ""), ("3", "All lines", ""),
-                    ("4", "Custom number of lines", ""), ("5", "Follow live (Ctrl-C to stop)", "")])
+                    ("4", "Custom number of lines", ""), ("5", "Follow live (Ctrl-C to stop)", ""),
+                    ("6", "Since a time (e.g. 15m, 2h, 2026-10-22)", ""),
+                    ("t", "Timestamps: " + ("on" if timestamps else "off"), "")], message)
+        message = None
         if key in ("b", ""):
             return
-        if key in ("1", "2", "3", "4"):
+        if key == "t":
+            timestamps = not timestamps
+        elif key in ("1", "2", "3", "4", "6"):
             tail: Optional[str] = {"1": "100", "2": "500", "3": "all"}.get(key)
+            since = None
             if key == "4":
                 n = ask("How many lines? ")
                 if not n.isdecimal() or int(n) < 1:
                     continue
                 tail = n
-            page_command(build(tail, False), cwd=cwd, at_end=True, title=title)
+            elif key == "6":
+                since = ask("Since (a duration such as 15m or 2h30m, a date or date-time): ")
+                if not since:
+                    continue
+                if not LOG_SINCE_RE.fullmatch(since):
+                    message = c("Not a duration or date Docker understands: %s" % since, "yellow")
+                    continue
+            page_command(build(log_options(tail, since=since, timestamps=timestamps)), cwd=cwd,
+                         at_end=True, title=title)
         elif key == "5":
             clear()
             print(c("Following logs. Press Ctrl-C to stop.", "dim"))
-            rc = run_fg(build("100", True), cwd=cwd)
+            rc = run_fg(build(log_options("100", follow=True, timestamps=timestamps)), cwd=cwd)
             print()
             if rc not in (0, -signal.SIGINT, 130):
                 report_rc(rc)
@@ -1583,7 +1613,8 @@ def container_details(ct: Container) -> str:
         out.append("OOM killed:  yes")
     if st.get("Error"):
         out.append("Error:       %s" % st.get("Error"))
-    out.append("Restart:     %s" % ct.restart)
+    out.append("Restart:     %s%s" % (ct.restart, "  (restarted %d times since it was last started by hand)"
+                                       % ct.restart_count if ct.restart_count else ""))
     cmd = [d.get("Path", "")] + list(d.get("Args") or [])
     out.append("Command:     %s" % shlex.join([x for x in cmd if x]))
     health = st.get("Health") or {}
@@ -2181,8 +2212,7 @@ def project_logs(p: Project) -> None:
             choice = [services[int(pick) - 1]]
     base, cwd = compose_base(p), compose_cwd(p)
     title = "Logs: %s%s" % (p.name, (" / " + choice[0]) if choice else " (all services)")
-    logs_menu(title, lambda tail, follow: base + ["logs"] + (["-f"] if follow else []) +
-              (["--tail", tail] if tail else []) + choice, cwd=cwd)
+    logs_menu(title, lambda opts: base + ["logs"] + opts + choice, cwd=cwd)
 
 
 @dataclass
@@ -2530,8 +2560,13 @@ Containers
   stopped containers and the health status when the image defines a check.
   PORTS shows published ports as host->container (an IP prefix means the port
   is only published on that address).
+  STATE also shows how often the restart policy has restarted a container since
+  it was last started by hand; a running container with restarts is yellow,
+  which usually means it keeps crashing.
   Open a container for logs, start/stop/restart, a shell, one-off commands,
-  details, environment (values hidden by default), mounts and removal."""
+  details, environment (values hidden by default), mounts and removal.
+  Logs: last N lines, follow live, or everything since a time (15m, 2h,
+  2026-10-22); t toggles timestamps."""
 
 STATS_HELP = LIST_HELP + """
 

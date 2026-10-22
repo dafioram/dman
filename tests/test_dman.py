@@ -271,6 +271,22 @@ class EndpointTests(unittest.TestCase):
         self.assertIsNotNone(self.check({}, self.runner(host="")).problem)
 
 
+class LogTests(unittest.TestCase):
+    def test_options(self):
+        self.assertEqual(dman.log_options("100"), ["--tail", "100"])
+        self.assertEqual(dman.log_options("100", follow=True), ["-f", "--tail", "100"])
+        self.assertEqual(dman.log_options("100", follow=True, timestamps=True), ["-f", "-t", "--tail", "100"])
+        self.assertEqual(dman.log_options(since="15m"), ["--since", "15m"])
+        self.assertEqual(dman.log_options(), [])
+
+    def test_since_values(self):
+        for ok in ["15m", "2h30m", "1.5h", "90s", "2026-10-22", "2026-10-22T10:00",
+                   "2026-10-22T10:00:00Z", "2026-10-22T10:00:00+02:00", "1761100000"]:
+            self.assertTrue(dman.LOG_SINCE_RE.fullmatch(ok), ok)
+        for bad in ["", "15", "m", "yesterday", "15 m", "--tail", "2026-10"]:
+            self.assertFalse(dman.LOG_SINCE_RE.fullmatch(bad), bad)
+
+
 class LayoutTests(unittest.TestCase):
     def test_columns_fit_and_drop(self):
         cols = [dman.Col("NAME", str, max=30, min=6, flex=True, want=12),
@@ -327,6 +343,18 @@ class ContainerTests(unittest.TestCase):
         self.assertTrue(ct.stopped)
         self.assertEqual((ct.project, ct.service), ("p", "s"))
         self.assertEqual(ct.created.tzinfo, timezone.utc)
+
+    def test_restart_count(self):
+        ct = make_container("loop")
+        self.assertEqual((ct.restart_count, ct.state_text(), dman.state_style(ct)), (0, "running", ("green",)))
+        ct.restart_count = 1
+        self.assertEqual(ct.state_text(), "running (1 restart)")
+        ct.restart_count = 7
+        self.assertEqual(ct.state_text(), "running (7 restarts)")
+        self.assertEqual(dman.state_style(ct), ("yellow",))
+        self.assertIn("restarted 7 times", dman.container_details(ct))
+        raw = dict(make_container("x").raw, RestartCount=3)
+        self.assertEqual(dman.container_from_inspect(raw).restart_count, 3)
 
     def test_mount_rows(self):
         vol = dman.Volume("data", "local", "/var/lib/docker/volumes/data/_data", None, {dman.L_PROJECT: "p"})
