@@ -1,0 +1,18 @@
+# dman configuration
+#
+# dman reads the first of these that exists:
+#   --config FILE, $DMAN_CONFIG, ~/.config/dman/dman.conf, /etc/dman/dman.conf
+
+[projects]
+# Folders that hold your Compose projects, one per line.
+# dman looks for compose.yaml / docker-compose.yml (and variants such as
+# docker-compose.prod.yml) in each folder and up to `depth` levels below it.
+roots =
+    /opt/docker
+
+# 0 = only the folders themselves, 1 = their subfolders, 2 = one level deeper.
+depth = 2
+
+[ui]
+# Rows per page in lists: a number, or auto to fit the terminal.
+page_size = auto
