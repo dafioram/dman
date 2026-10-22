@@ -2124,6 +2124,8 @@ def project_view(key: str) -> None:
             opts += [("12", "View compose file(s)", ""), ("13", "Resolved config", ""), ("14", "Environment", "")]
         if len(p.folder_files) > 1 or (not p.files and p.folder_files):
             opts.append(("15", "Choose compose files", ""))
+        if len(p.services()) > 1:
+            opts.append(("16", "One service...", ""))
         key_in = menu(project_header(p), opts, message)
         message = None
         if key_in == "b":
@@ -2169,6 +2171,8 @@ def project_view(key: str) -> None:
             project_env(p)
         elif key_in == "15":
             choose_files(p)
+        elif key_in == "16":
+            pick_service(p)
 
 
 def compose_run(p: Project, steps: List[List[str]], explain: str, ask_first: bool = True,
@@ -2215,6 +2219,99 @@ def project_logs(p: Project) -> None:
     base, cwd = compose_base(p), compose_cwd(p)
     title = "Logs: %s%s" % (p.name, (" / " + choice[0]) if choice else " (all services)")
     logs_menu(title, lambda opts: base + ["logs"] + opts + choice, cwd=cwd)
+
+
+def service_names(p: Project) -> Tuple[List[str], Optional[str]]:
+    """Services from the compose file(s), plus any that only exist as containers."""
+    names = set(p.services()) if p.containers else set()
+    err = None
+    if p.files:
+        r = run(compose_base(p) + ["config", "--services"], cwd=compose_cwd(p), timeout=60)
+        if r.ok:
+            names.update(r.out.split())
+        else:
+            err = r.message()
+    return sorted(names), err
+
+
+def pick_service(p: Project) -> None:
+    clear()
+    title_line("Services of " + p.name)
+    print("Reading the compose file...")
+    names, err = service_names(p)
+    if err:
+        print(c("Could not read the compose file: " + err.splitlines()[0], "yellow"))
+    if not names:
+        print("No services found.")
+        pause()
+        return
+    if len(names) == 1:
+        service_view(p.key, p.directory, names[0])
+        return
+    states = p.services()
+    for i, n in enumerate(names, 1):
+        cts = states.get(n, [])
+        print("  %d  %-20s %s" % (i, n, ", ".join(ct.state_text() for ct in cts) or c("no container", "dim")))
+    pick = ask("\nWhich service? ")
+    if pick.isdecimal() and 1 <= int(pick) <= len(names):
+        service_view(p.key, p.directory, names[int(pick) - 1])
+
+
+def service_view(key: str, directory: Optional[str], svc: str) -> None:
+    message = None
+    while True:
+        p = find_project(key, directory)
+        if p is None:
+            print(c("That project is no longer found.", "yellow"))
+            pause()
+            return
+        key, directory = p.key, p.directory
+        cts = p.services().get(svc, [])
+        header = [c("%s / %s" % (p.name, svc), "bold", "cyan")]
+        for ct in cts:
+            header.append("  %s  %s  %s" % (ct.name, c(ct.state_text(), *state_style(ct)), c(", ".join(ct.ports), "dim")))
+        if not cts:
+            header.append(c("  no container yet", "dim"))
+        opts: List[Tuple[str, str, str]] = []
+        if cts:
+            opts += [("1", "Logs", ""), ("2", "Restart", ""), ("3", "Stop", ""), ("4", "Start", "")]
+        if p.can_up:
+            opts += [("5", "Up (create or recreate)", ""), ("6", "Up with build", ""), ("7", "Pull & up", "")]
+        if cts:
+            opts.append(("8", "Container" + ("s" if len(cts) > 1 else ""), ""))
+        key_in = menu(header, opts, message)
+        message = None
+        if key_in == "b":
+            return
+        if key_in == "" or key_in not in {k for k, _, _ in opts}:
+            if key_in:
+                message = c("Not available here: %s" % key_in, "yellow")
+            continue
+        deps = "Services it depends on are started too if they are not running."
+        if key_in == "1":
+            logs_menu("Logs: %s / %s" % (p.name, svc), lambda opts, p=p: compose_base(p) + ["logs"] + opts + [svc],
+                      cwd=compose_cwd(p))
+        elif key_in == "2":
+            compose_run(p, [["restart", svc]], "Restarts the %s container(s)." % svc)
+        elif key_in == "3":
+            compose_run(p, [["stop", svc]], "Stops the %s container(s) but keeps them." % svc)
+        elif key_in == "4":
+            compose_run(p, [["start", svc]], "Starts the existing %s container(s)." % svc, ask_first=False)
+        elif key_in == "5":
+            compose_run(p, [["up", "-d", svc]], "Creates or recreates %s so it matches the compose file. %s" % (svc, deps))
+        elif key_in == "6":
+            compose_run(p, [["up", "-d", "--build", svc]],
+                        "Builds %s if it has a build: section, then creates or recreates it. %s" % (svc, deps))
+        elif key_in == "7":
+            compose_run(p, [["pull", svc], ["up", "-d", svc]],
+                        "Pulls a newer image for %s, then recreates it if the image changed. %s" % (svc, deps))
+        elif key_in == "8":
+            if len(cts) == 1:
+                container_view(cts[0].id)
+            else:
+                pick = ask("Which? " + "  ".join("%d) %s" % (i, x.name) for i, x in enumerate(cts, 1)) + "  : ")
+                if pick.isdecimal() and 1 <= int(pick) <= len(cts):
+                    container_view(cts[int(pick) - 1].id)
 
 
 @dataclass
@@ -2606,6 +2703,10 @@ Compose projects
   A folder project that has never been started shows as 'not deployed' and can
   be started with Up. 'pick files' means a folder has several variant files and
   no standard one: open it and choose which to use.
+
+  One service      shown for projects with several services: logs, restart,
+                   stop, start, up, up with build and pull & up for just one
+                   (Up also starts the services it depends on)
 
   Up               docker compose up -d
   Up with build    docker compose up -d --build
