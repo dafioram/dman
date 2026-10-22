@@ -173,6 +173,8 @@ def parse_ts(text: Optional[str]) -> Optional[datetime]:
         return None
     date, clock, frac, tz = m.groups()
     frac = (frac or "")[:7]
+    if frac:
+        frac = frac.ljust(7, "0")    # Python < 3.11 accepts only 3 or 6 fractional digits
     tz = tz or "Z"
     if tz == "Z":
         tz = "+00:00"

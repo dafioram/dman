@@ -48,6 +48,9 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual((dt.year, dt.second, dt.microsecond), (2026, 57, 5958))
         self.assertEqual(dt.utcoffset().total_seconds(), 0)
         self.assertEqual(dman.parse_ts("2026-10-18T23:02:56-04:00").utcoffset().total_seconds(), -4 * 3600)
+        self.assertEqual(dman.parse_ts("2026-10-19T03:02:57.5Z").microsecond, 500000)
+        self.assertEqual(dman.parse_ts("2026-10-19T03:02:57.1234+02:00").microsecond, 123400)
+        self.assertEqual(dman.parse_ts("2026-10-19T03:02:57Z").microsecond, 0)
         self.assertIsNone(dman.parse_ts("0001-01-01T00:00:00Z"))
         self.assertIsNone(dman.parse_ts("garbage"))
 
