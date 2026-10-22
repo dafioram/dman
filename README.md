@@ -144,6 +144,18 @@ python3 -m unittest discover -s tests -v
 The tests cover parsing, project discovery, endpoint checks and the down -v preview,
 with no Docker daemon needed.
 
+Integration tests run against the local Docker daemon. They create and then remove a
+throwaway Compose project (built `FROM scratch`, containers never started), so they
+only run when asked:
+
+```sh
+DMAN_INTEGRATION=1 python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the unit tests on Python 3.9-3.13,
+the integration tests on a runner with Docker, ShellCheck on the scripts, and an
+install / reinstall / uninstall cycle into a temporary prefix.
+
 ## Version
 
 `VERSION` holds one whole number. Each published package revision gets the next
