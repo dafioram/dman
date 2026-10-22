@@ -117,7 +117,8 @@ else
     mkdir -p "$CONF_DIR"
     {
         sed -n '1,/^roots =/p' "$SRC/dman.conf.example"
-        for r in $roots; do printf '    %s\n' "$r"; done
+        read -r -a root_list <<< "$roots"    # split on spaces, no glob expansion
+        for r in "${root_list[@]}"; do printf '    %s\n' "$r"; done
         sed -n '/^roots =/,$p' "$SRC/dman.conf.example" | sed '1,2d'
     } > "$CONF"
     chmod 0644 "$CONF"

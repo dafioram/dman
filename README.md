@@ -134,6 +134,10 @@ and `/opt/docker/group/app/compose.yaml` are found. Hidden folders and `node_mod
   volumes only, typed name) or Down + remove volumes.
 - **Secrets.** Environment views hide values until you ask to reveal them. Raw inspect
   and the resolved Compose config ask first, since they contain values too.
+- **Terminal output.** Text that comes from Docker or from files (names, labels, health
+  check output, compose files, error messages) has control characters removed before
+  it is shown, so it cannot move the cursor, change the window title or write to the
+  clipboard. Log and command output (Logs, a shell, Up) is shown as Docker prints it.
 
 ## Tests
 

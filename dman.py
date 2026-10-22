@@ -105,10 +105,38 @@ def term_size() -> Tuple[int, int]:
     return max(size.columns, 20), max(size.lines, 10)
 
 
+# dman's own styles (see Style.codes) pass through; every other control character is
+# dropped, so names, labels, file contents and Docker output cannot move the cursor,
+# set the window title, write the clipboard (OSC 52) and so on.
+_OWN_SGR = r"\x1b\[(?:[0-2]|3[1-6])(?:;(?:[0-2]|3[1-6]))*m"
+_CONTROL_RE = re.compile(r"(%s)|[\x00-\x08\x0b-\x1f\x7f-\x9f]" % _OWN_SGR)
+
+
+def strip_controls(text: str) -> str:
+    return _CONTROL_RE.sub(lambda m: m.group(1) or "", text)
+
+
+class SafeOutput:
+    """Wraps sys.stdout and passes everything written through strip_controls.
+    Other attributes (fileno, isatty, encoding, ...) are the real stream's, so input()
+    still uses readline."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+
+    def write(self, text: str) -> int:
+        self.stream.write(strip_controls(text))
+        return len(text)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
+
+
 def clear() -> None:
     if sys.stdout.isatty():
-        sys.stdout.write("\033[H\033[2J")
-        sys.stdout.flush()
+        out = getattr(sys.stdout, "stream", sys.stdout)
+        out.write("\033[H\033[2J")
+        out.flush()
     else:
         print()
 
@@ -217,7 +245,7 @@ def parse_selection(text: str, count: int) -> Optional[List[int]]:
             if a < 1 or b > count:
                 return None
             picked.update(range(a - 1, b))
-        elif part.isdigit():
+        elif part.isdecimal():
             k = int(part)
             if not 1 <= k <= count:
                 return None
@@ -314,7 +342,7 @@ def pager_argv(at_end: bool = False, title: str = "") -> Optional[List[str]]:
 
 def show_text(text: str, title: Optional[str] = None) -> None:
     """Show text, through `less` when it will not fit on the screen."""
-    body = ((title + "\n" + "=" * min(len(title), 60) + "\n\n") if title else "") + text.rstrip() + "\n"
+    body = strip_controls(((title + "\n" + "=" * min(len(title), 60) + "\n\n") if title else "") + text.rstrip() + "\n")
     _, rows = term_size()
     pager = pager_argv(title=title or "")
     if pager and body.count("\n") > rows - 2:
@@ -537,7 +565,7 @@ def format_ports(ports: Optional[Dict[str, Any]]) -> List[str]:
 
     def sort_key(item: Tuple[str, Any]) -> Tuple[int, str]:
         num = item[0].split("/")[0]
-        return (int(num) if num.isdigit() else 0, item[0])
+        return (int(num) if num.isdecimal() else 0, item[0])
 
     for cport, binds in sorted((ports or {}).items(), key=sort_key):
         if not binds:
@@ -765,13 +793,13 @@ def parse_config(parser: configparser.ConfigParser, path: Optional[str], warning
                 roots.append(p)
     depth = DEFAULT_DEPTH
     raw_depth = parser.get("projects", "depth", fallback=str(DEFAULT_DEPTH)).strip()
-    if raw_depth.isdigit():
+    if raw_depth.isdecimal():
         depth = min(int(raw_depth), MAX_DEPTH)
     else:
         warnings.append("depth = %r is not a number; using %d." % (raw_depth, DEFAULT_DEPTH))
     page_size = None
     raw_ps = parser.get("ui", "page_size", fallback="auto").strip().lower()
-    if raw_ps.isdigit() and int(raw_ps) > 0:
+    if raw_ps.isdecimal() and int(raw_ps) > 0:
         page_size = int(raw_ps)
     elif raw_ps != "auto":
         warnings.append("page_size = %r is not a number or 'auto'." % raw_ps)
@@ -1180,7 +1208,7 @@ class ListView:
             low = key.lower()
             if low == "":
                 continue
-            if low.isdigit():
+            if low.isdecimal():
                 n = int(low)
                 if self.on_select and 1 <= n <= len(page_items):
                     self.on_select(page_items[n - 1])
@@ -1213,7 +1241,7 @@ class ListView:
         for i, (label, _) in enumerate(self.sorts, 1):
             print("  %d  %s" % (i, label))
         pick = ask("Sort by: ")
-        if pick.isdigit() and 1 <= int(pick) <= len(self.sorts):
+        if pick.isdecimal() and 1 <= int(pick) <= len(self.sorts):
             self.sort_idx = int(pick) - 1
             self.page = 0
 
@@ -1478,7 +1506,7 @@ def logs_menu(title: str, build: Callable[[Optional[str], bool], List[str]], cwd
             tail: Optional[str] = {"1": "100", "2": "500", "3": "all"}.get(key)
             if key == "4":
                 n = ask("How many lines? ")
-                if not n.isdigit() or int(n) < 1:
+                if not n.isdecimal() or int(n) < 1:
                     continue
                 tail = n
             page_command(build(tail, False), cwd=cwd, at_end=True, title=title)
@@ -1640,7 +1668,7 @@ def mounts_of_container(ct: Container) -> None:
         key = menu(header, opts)
         if key in ("b", ""):
             return
-        if key.isdigit() and 1 <= int(key) <= len(mounts):
+        if key.isdecimal() and 1 <= int(key) <= len(mounts):
             m = mounts[int(key) - 1]
             if m.get("Type") == "volume":
                 mount_view("volume", m.get("Name", ""))
@@ -1755,7 +1783,7 @@ def image_view(iid: str) -> None:
             tag = img.tags[0]
             if len(img.tags) > 1:
                 pick = ask("Pull which tag? " + "  ".join("%d) %s" % (i, t) for i, t in enumerate(img.tags, 1)) + "  : ")
-                if not (pick.isdigit() and 1 <= int(pick) <= len(img.tags)):
+                if not (pick.isdecimal() and 1 <= int(pick) <= len(img.tags)):
                     continue
                 tag = img.tags[int(pick) - 1]
             clear()
@@ -1917,7 +1945,7 @@ def mount_view(kind: str, name: str) -> None:
                 container_view(names[0].id)
             else:
                 pick = ask("Which? " + "  ".join("%d) %s" % (i, x.name) for i, x in enumerate(names, 1)) + "  : ")
-                if pick.isdigit() and 1 <= int(pick) <= len(names):
+                if pick.isdecimal() and 1 <= int(pick) <= len(names):
                     container_view(names[int(pick) - 1].id)
         elif key == "2" and row.volume:
             r = docker("volume", "inspect", name)
@@ -2149,7 +2177,7 @@ def project_logs(p: Project) -> None:
         pick = ask("\nWhich? [0] ")
         if pick == "b":
             return
-        if pick.isdigit() and 1 <= int(pick) <= len(services):
+        if pick.isdecimal() and 1 <= int(pick) <= len(services):
             choice = [services[int(pick) - 1]]
     base, cwd = compose_base(p), compose_cwd(p)
     title = "Logs: %s%s" % (p.name, (" / " + choice[0]) if choice else " (all services)")
@@ -2296,7 +2324,7 @@ def choose_files(p: Project) -> None:
         return
     idx: List[int] = []
     for part in re.split(r"[,\s]+", pick.strip()):
-        if part.isdigit() and 1 <= int(part) <= len(names) and int(part) - 1 not in idx:
+        if part.isdecimal() and 1 <= int(part) <= len(names) and int(part) - 1 not in idx:
             idx.append(int(part) - 1)
         elif part:
             print(c("Invalid choice.", "yellow"))
@@ -2666,10 +2694,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     global CFG
     CFG = load_config(args.config)
+    sys.stdout = SafeOutput(sys.stdout)
     init_terminal()
     problem = preflight()
     if problem:
-        print("%s: %s" % (APP, problem), file=sys.stderr)
+        print("%s: %s" % (APP, strip_controls(problem)), file=sys.stderr)
         return 1
     try:
         main_menu()
