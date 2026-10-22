@@ -368,6 +368,34 @@ class ContainerTests(unittest.TestCase):
         raw = dict(make_container("x").raw, RestartCount=3)
         self.assertEqual(dman.container_from_inspect(raw).restart_count, 3)
 
+    def test_crash_loop_and_health_text(self):
+        ct = make_container("loop", state="restarting")
+        ct.restart_count = 10
+        self.assertEqual(ct.state_text(), "restarting (exit 1, 10 restarts)")
+        self.assertEqual(dman.state_style(ct), ("red",))
+        self.assertFalse(ct.stopped)
+        ct = make_container("gone", state="exited")
+        ct.restart_count = 3
+        self.assertEqual(ct.state_text(), "exited (1, 3 restarts)")
+        ct = make_container("sick")
+        ct.health = "unhealthy"
+        self.assertEqual((ct.state_text(), dman.state_style(ct)), ("running unhealthy", ("red",)))
+
+    def test_project_status(self):
+        def project(*cts):
+            return dman.Project(key="project:p", name="p", name_known=True, directory=None, folder_files=[],
+                                files=["/x/compose.yaml"], files_how="deployed", containers=list(cts))
+        ok, sick, loop, down = (make_container("a"), make_container("b"), make_container("c", state="restarting"),
+                                make_container("d", state="exited"))
+        sick.health = "unhealthy"
+        self.assertEqual(project(ok).status, "running")
+        self.assertEqual(project(ok, sick).status, "unhealthy")
+        self.assertEqual(project(ok, loop).status, "restarting")
+        self.assertEqual(project(loop).status, "restarting")
+        self.assertEqual(project(ok, down).status, "partial")
+        self.assertEqual(project(down).status, "stopped")
+        self.assertEqual(dman.project_style(project(loop)), ("red",))
+
     def test_mount_rows(self):
         vol = dman.Volume("data", "local", "/var/lib/docker/volumes/data/_data", None, {dman.L_PROJECT: "p"})
         unused = dman.Volume("spare", "local", "/v/spare", None, {})

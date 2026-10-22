@@ -544,14 +544,16 @@ class Container:
         return self.state in ("exited", "created", "dead")
 
     def state_text(self) -> str:
-        text = self.state
+        """e.g. 'exited (1)', 'running healthy', 'restarting (exit 1, 10 restarts)'."""
+        text = self.state + (" " + self.health if self.health else "")
+        extra = []
         if self.state in ("exited", "dead"):
-            text += " (%d)" % self.exit_code
-        if self.health:
-            text += " " + self.health
+            extra.append("%d" % self.exit_code)
+        elif self.state == "restarting":
+            extra.append("exit %d" % self.exit_code)
         if self.restart_count:
-            text += " (%d restart%s)" % (self.restart_count, "" if self.restart_count == 1 else "s")
-        return text
+            extra.append("%d restart%s" % (self.restart_count, "" if self.restart_count == 1 else "s"))
+        return text + (" (%s)" % ", ".join(extra) if extra else "")
 
     def since(self) -> str:
         if self.running:
@@ -916,8 +918,10 @@ class Project:
     def status(self) -> str:
         if not self.containers:
             return "not deployed" if self.files else "pick files"
+        if any(ct.state == "restarting" for ct in self.containers):
+            return "restarting"
         if self.running == len(self.containers):
-            return "running"
+            return "unhealthy" if any(ct.health == "unhealthy" for ct in self.containers) else "running"
         return "partial" if self.running else "stopped"
 
     @property
@@ -1378,7 +1382,7 @@ def state_style(ct: Container) -> Sequence[str]:
 def container_cols() -> List[Col]:
     return [
         Col("NAME", lambda ct: ct.name, max=32, min=8, flex=True, want=16),
-        Col("STATE", lambda ct: ct.state_text(), max=22, min=7, flex=True, style=state_style, want=9),
+        Col("STATE", lambda ct: ct.state_text(), max=32, min=7, flex=True, style=state_style, want=32),
         Col("PORTS", lambda ct: ", ".join(ct.ports) or "-", max=40, min=6, flex=True, want=12),
         Col("PROJECT/SERVICE", lambda ct: ("%s/%s" % (ct.project, ct.service)) if ct.project else "-",
             max=30, min=8, flex=True, drop=2),
@@ -1431,9 +1435,9 @@ def container_view(cid: str) -> None:
             pause()
             return
         opts = [("1", "Logs", "")]
-        if not ct.running and ct.state != "paused":
+        if ct.stopped:
             opts.append(("2", "Start", ""))
-        if ct.running:
+        if ct.running or ct.state == "restarting":
             opts.append(("3", "Stop", ""))
         opts.append(("4", "Restart", ""))
         if ct.running:
@@ -2024,8 +2028,8 @@ def remove_volume(row: MountRow) -> bool:
 def project_style(p: Project) -> Sequence[str]:
     if p.containers and not p.files:
         return ("red",)
-    return {"running": ("green",), "partial": ("yellow",), "stopped": ("yellow",),
-            "pick files": ("yellow",)}.get(p.status, ("dim",))
+    return {"restarting": ("red",), "unhealthy": ("red",), "running": ("green",), "partial": ("yellow",),
+            "stopped": ("yellow",), "pick files": ("yellow",)}.get(p.status, ("dim",))
 
 
 def projects_screen() -> None:
@@ -2054,7 +2058,8 @@ def projects_screen() -> None:
         Col("UP", lambda p: "%d/%d" % (p.running, len(p.containers)) if p.containers else "-", max=6),
         Col("FOLDER", where, max=60, min=8, flex=True, drop=1, want=14),
     ]
-    order = {"running": 0, "partial": 1, "stopped": 2, "pick files": 3, "not deployed": 4}
+    order = {"restarting": 0, "unhealthy": 1, "running": 2, "partial": 3, "stopped": 4, "pick files": 5,
+             "not deployed": 6}
     sorts = [("name", lambda xs: sorted(xs, key=lambda p: p.name)),
              ("status", lambda xs: sorted(xs, key=lambda p: (order.get(p.status, 9), p.name))),
              ("folder", lambda xs: sorted(xs, key=lambda p: (p.directory or "~", p.name)))]
@@ -2661,7 +2666,8 @@ Containers
   is only published on that address).
   STATE also shows how often the restart policy has restarted a container since
   it was last started by hand; a running container with restarts is yellow,
-  which usually means it keeps crashing.
+  which usually means it keeps crashing. A container stuck in a crash loop shows
+  'restarting' with its last exit code; Stop ends the loop.
   Open a container for logs, start/stop/restart, a shell, one-off commands,
   details, environment (values hidden by default), mounts and removal.
   Logs: last N lines, follow live, or everything since a time (15m, 2h,
@@ -2701,7 +2707,8 @@ Compose projects
      variants such as docker-compose.prod.yml;
    - containers that Compose created (their labels), wherever they came from.
   A folder project that has never been started shows as 'not deployed' and can
-  be started with Up. 'pick files' means a folder has several variant files and
+  be started with Up. 'restarting' (a container is crash-looping) and
+  'unhealthy' (a health check fails) are shown in red. 'pick files' means a folder has several variant files and
   no standard one: open it and choose which to use.
 
   One service      shown for projects with several services: logs, restart,
@@ -2788,10 +2795,17 @@ def main_menu() -> None:
     }
     message = None
     while True:
-        r = docker("ps", "-a", "--format", "{{.State}}", timeout=20)
-        states = r.out.split() if r.ok else []
-        summary = ("%d containers, %d running" % (len(states), states.count("running"))) if r.ok else "Docker not responding"
-        key = menu([c("dman", "bold", "cyan") + c("  Docker on this host - " + summary, "dim")],
+        r = docker("ps", "-a", "--format", "{{.State}}\t{{.Status}}", timeout=20)
+        rows = [line.split("\t", 1) + [""] for line in r.out.splitlines()] if r.ok else []
+        summary = c("  Docker on this host - " + ("%d containers, %d running" % (
+            len(rows), sum(1 for x in rows if x[0] == "running")) if r.ok else "Docker not responding"), "dim")
+        restarting = sum(1 for x in rows if x[0] == "restarting")
+        unhealthy = sum(1 for x in rows if "(unhealthy)" in x[1])
+        if restarting:
+            summary += c(", %d restarting" % restarting, "red")
+        if unhealthy:
+            summary += c(", %d unhealthy" % unhealthy, "red")
+        key = menu([c("dman", "bold", "cyan") + summary],
                    [("1", "Compose projects", ""), ("2", "Containers", ""), ("3", "Live resource usage", ""),
                     ("4", "Images", ""), ("5", "Volumes & mounts", ""), ("6", "Disk usage & cleanup", ""),
                     ("7", "System info", ""), ("h", "Help", "")], message)

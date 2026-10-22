@@ -61,7 +61,9 @@ Main menu:
    Restart, Stop, Start, Logs, Down, Down + remove volumes, the containers of the
    project, the compose file(s), the resolved config and the environment. Projects
    with several services also get **One service**: logs, restart, stop, start, up,
-   up with build or pull & up for just that service.
+   up with build or pull & up for just that service. A project whose container is
+   crash-looping shows `restarting`, one with a failing health check `unhealthy`;
+   both are red and come first when sorted by status. The main menu counts them too.
 2. **Containers**: all containers with state, health, restart count, published ports,
    project and age. A running container that its restart policy keeps restarting is
    shown in yellow. Logs (last 100 / 500 / all / custom, since a time such as `15m` or
