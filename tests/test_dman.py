@@ -358,6 +358,43 @@ class NavigationTests(unittest.TestCase):
             dman.term_size = real
 
 
+class NetworkTests(unittest.TestCase):
+    RAW = {"Id": "f" * 64, "Name": "blog_default", "Driver": "bridge", "Scope": "local", "Internal": False,
+           "Created": "2026-10-22T12:35:36.123456789Z", "Labels": {dman.L_PROJECT: "blog"},
+           "IPAM": {"Config": [{"Subnet": "172.18.0.0/16", "Gateway": "172.18.0.1"}, {"Subnet": "fd00::/64"}]},
+           "Containers": {}}
+
+    def test_from_inspect(self):
+        n = dman.network_from_inspect(self.RAW)
+        self.assertEqual((n.name, n.short_id, n.project, n.builtin), ("blog_default", "f" * 12, "blog", False))
+        self.assertEqual((n.subnets, n.gateways), (["172.18.0.0/16", "fd00::/64"], ["172.18.0.1"]))
+        self.assertEqual(n.created.tzinfo, timezone.utc)
+        for name in ("bridge", "host", "none"):
+            self.assertTrue(dman.network_from_inspect(dict(self.RAW, Name=name)).builtin)
+        empty = dman.network_from_inspect({"Name": "x"})
+        self.assertEqual((empty.subnets, empty.labels, empty.internal), ([], {}, False))
+
+    def test_users_include_stopped_containers(self):
+        n = dman.network_from_inspect(self.RAW)
+        up = make_container("blog-site-1")
+        down = make_container("blog-db-1", state="exited")
+        other = make_container("web-1")
+        up.networks, down.networks, other.networks = ["blog_default"], ["blog_default"], ["web_default"]
+        self.assertEqual([c.name for c in dman.network_users(n, [up, down, other])], ["blog-site-1", "blog-db-1"])
+
+    def test_folder_size(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "f"), "wb") as fh:
+                fh.write(b"x" * 100000)
+            size, note = dman.folder_size(d)
+            self.assertIsNone(note)
+            self.assertGreaterEqual(size, 100000)
+            size, note = dman.folder_size(os.path.join(d, "missing"))
+            self.assertTrue(note)
+        self.assertIn("free of", dman.disk_space_text("/"))
+        self.assertTrue(dman.disk_space_text("/nonexistent/path").startswith("unknown"))
+
+
 class LayoutTests(unittest.TestCase):
     def test_columns_fit_and_drop(self):
         cols = [dman.Col("NAME", str, max=30, min=6, flex=True, want=12),

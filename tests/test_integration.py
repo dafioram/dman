@@ -100,11 +100,30 @@ class ComposeProjectTests(unittest.TestCase):
         img = next(i for i in images if self.name + "-img:test" in i.tags)
         self.assertEqual([u.id for u in dman.image_users(img, p.containers)], [ct.id])
 
+        nets, err = dman.list_networks()
+        self.assertIsNone(err)
+        by_name = {n.name: n for n in nets}
+        net = by_name[self.name + "_default"]
+        self.assertEqual((net.project, net.driver, net.builtin), (self.name, "bridge", False))
+        self.assertTrue(net.subnets)
+        # the container was never started, so `docker network inspect` lists no containers,
+        # but it is still attached and the network must count as used
+        self.assertEqual(net.raw.get("Containers") or {}, {})
+        self.assertEqual([u.id for u in dman.network_users(net, dman.list_containers()[0])], [ct.id])
+        self.assertTrue(by_name["bridge"].builtin)
+
         r = dman.run(dman.compose_base(p) + ["down", "-v"], cwd=dman.compose_cwd(p), timeout=120)
         self.assertTrue(r.ok, r.message())
         p = self.project()
         self.assertEqual(p.status, "not deployed")
         self.assertNotIn(self.name + "_data", dman.docker("volume", "ls", "-q").out.split())
+        self.assertNotIn(self.name + "_default", [n.name for n in dman.list_networks()[0]])
+
+    def test_folder_size_and_disk_space(self):
+        size, note = dman.folder_size(self.folder)
+        self.assertIsNone(note)
+        self.assertGreater(size, 0)
+        self.assertRegex(dman.disk_space_text(self.folder), r"free of .* \(\d+% used\)")
 
 
 if __name__ == "__main__":

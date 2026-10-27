@@ -74,8 +74,15 @@ Main menu:
 5. **Volumes & mounts**: Docker volumes and bind mounts, which containers use them,
    their project; `z` fetches sizes on demand; remove unused volumes.
 6. **Disk usage & cleanup**: `docker system df`, plus reviewed cleanup of stopped
-   containers, unused images and build cache. Volumes are never removed here.
-7. **System info**: versions, the Docker endpoint, the config file and project folders.
+   containers, unused images, build cache and unused networks. Volumes are never
+   removed here.
+7. **System info**: versions, the Docker endpoint, the Docker data folder (for example
+   `/var/lib/docker`) with its size and the free space on its disk, the config file
+   and project folders. Measuring the folder needs root to be complete.
+8. **Networks**: every network with its driver, subnet, Compose project and the
+   containers attached to it; inspect one, open a container on it, or remove it when
+   no container (running or stopped) uses it. Built-in networks (bridge, host, none)
+   are never removed.
 
 Keys in lists: a number opens an item, `n`/`p` page, `s` sort, `f` filter, Enter
 refreshes, `h` help, `b` back, `m` main menu, `q` quit. `b`, `m` and `q` work in every
