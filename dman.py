@@ -766,6 +766,63 @@ def build_mount_rows(volumes: Sequence[Volume], containers: Sequence[Container])
     return rows
 
 
+# ---- networks -------------------------------------------------------------- #
+
+BUILTIN_NETWORKS = {"bridge", "host", "none"}
+
+
+@dataclass
+class Network:
+    id: str
+    name: str
+    driver: str
+    scope: str
+    internal: bool
+    created: Optional[datetime]
+    labels: Dict[str, str]
+    subnets: List[str]
+    gateways: List[str]
+    raw: Dict[str, Any] = field(repr=False, default_factory=dict)
+
+    @property
+    def short_id(self) -> str:
+        return self.id[:12]
+
+    @property
+    def project(self) -> str:
+        return self.labels.get(L_PROJECT, "")
+
+    @property
+    def builtin(self) -> bool:
+        return self.name in BUILTIN_NETWORKS
+
+
+def network_from_inspect(d: Dict[str, Any]) -> Network:
+    configs = (d.get("IPAM") or {}).get("Config") or []
+    return Network(id=d.get("Id", ""), name=d.get("Name", ""), driver=d.get("Driver", ""),
+                   scope=d.get("Scope", ""), internal=bool(d.get("Internal")), created=parse_ts(d.get("Created")),
+                   labels=d.get("Labels") or {}, subnets=[x["Subnet"] for x in configs if x.get("Subnet")],
+                   gateways=[x["Gateway"] for x in configs if x.get("Gateway")], raw=d)
+
+
+def list_networks() -> Tuple[List[Network], Optional[str]]:
+    r = docker("network", "ls", "-q", "--no-trunc")
+    if not r.ok:
+        return [], r.message()
+    ids = r.out.split()
+    if not ids:
+        return [], None
+    raw, err = inspect_many(("network", "inspect"), ids)
+    return [network_from_inspect(d) for d in raw], err
+
+
+def network_users(net: Network, containers: Sequence[Container]) -> List[Container]:
+    """Containers attached to the network, stopped ones included. `docker network
+    inspect` only lists running containers, but a stopped container still needs its
+    networks to start again."""
+    return [ct for ct in containers if net.name in ct.networks]
+
+
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
@@ -2045,6 +2102,126 @@ def remove_volume(row: MountRow) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Screens: networks
+# --------------------------------------------------------------------------- #
+
+def networks_screen() -> None:
+    state: Dict[str, List[Container]] = {"containers": []}
+
+    def fetch() -> Tuple[List[Network], Optional[str]]:
+        nets, err = list_networks()
+        state["containers"], err2 = list_containers()
+        return nets, err or err2
+
+    def used(net: Network) -> str:
+        users = network_users(net, state["containers"])
+        if users:
+            return ", ".join(sorted(ct.name for ct in users))
+        return "built-in" if net.builtin else "unused"
+
+    cols = [
+        Col("NAME", lambda n: n.name, max=40, min=10, flex=True, want=18),
+        Col("DRIVER", lambda n: n.driver + (" (internal)" if n.internal else ""), max=18, min=6),
+        Col("SUBNET", lambda n: ", ".join(n.subnets) or "-", max=20, min=6, flex=True, drop=2),
+        Col("PROJECT", lambda n: n.project or "-", max=18, min=6, flex=True, drop=1),
+        Col("USED BY", used, max=40, min=6, flex=True, want=14,
+            style=lambda n: ("dim",) if used(n) in ("unused", "built-in") else ()),
+    ]
+    sorts = [("name", lambda xs: sorted(xs, key=lambda n: (n.builtin, n.name))),
+             ("unused first", lambda xs: sorted(xs, key=lambda n: (used(n) != "unused", n.builtin, n.name))),
+             ("project", lambda xs: sorted(xs, key=lambda n: (not n.project, n.project, n.name)))]
+    ListView("Networks", fetch, cols, sorts=sorts,
+             search=lambda n: " ".join([n.name, n.driver, n.project, used(n)] + n.subnets),
+             on_select=lambda n: network_view(n.id), help_text=NETWORKS_HELP, empty="No networks.").run()
+
+
+def get_network(nid: str) -> Optional[Network]:
+    found = parse_json_array(docker("network", "inspect", nid).out)
+    return network_from_inspect(found[0]) if found else None
+
+
+def network_view(nid: str) -> None:
+    message = None
+    while True:
+        net = get_network(nid)
+        if net is None:
+            print(c("That network no longer exists.", "yellow"))
+            pause()
+            return
+        users = network_users(net, list_containers()[0])
+        header = [c("Network " + net.name, "bold", "cyan") + c("  " + net.short_id, "dim"),
+                  "Driver:      %s%s, scope %s" % (net.driver, " (internal: no outside access)" if net.internal else "",
+                                                   net.scope),
+                  "Subnet:      %s" % (", ".join(net.subnets) or "-"),
+                  "Gateway:     %s" % (", ".join(net.gateways) or "-"),
+                  "Created:     %s ago" % ago(net.created),
+                  "Project:     %s" % (net.project or "-")]
+        if net.builtin:
+            header.append(c("Built-in Docker network; it cannot be removed.", "dim"))
+        header.append("Used by:")
+        if not users:
+            header.append("  no containers (running or stopped)")
+        for ct in users:
+            ip = ((ct.raw.get("NetworkSettings") or {}).get("Networks") or {}).get(net.name, {}).get("IPAddress")
+            header.append("  %s [%s]%s" % (ct.name, ct.state, "  " + ip if ip else ""))
+        opts = [("1", "Open a container that uses it", "")] if users else []
+        opts.append(("2", "Raw inspect (JSON)", ""))
+        if not users and not net.builtin:
+            opts.append(("3", "Remove network", "red"))
+        key = menu(header, opts, message)
+        message = None
+        if key == "b":
+            return
+        if key == "1" and users:
+            if len(users) == 1:
+                container_view(users[0].id)
+            else:
+                pick = ask("Which? " + "  ".join("%d) %s" % (i, x.name) for i, x in enumerate(users, 1)) + "  : ")
+                if pick.isdecimal() and 1 <= int(pick) <= len(users):
+                    container_view(users[int(pick) - 1].id)
+        elif key == "2":
+            r = docker("network", "inspect", net.id)
+            show_text(r.out if r.ok else r.message(), "Inspect network " + net.name)
+        elif key == "3" and not users and not net.builtin:
+            if remove_networks([net]):
+                return
+        elif key:
+            message = c("Not available here: %s" % key, "yellow")
+
+
+def remove_networks(nets: List[Network], ask_first: bool = True) -> bool:
+    """Remove networks no container (running or stopped) uses. Returns True if all went."""
+    if ask_first:
+        print()
+        for net in nets:
+            print("  %s  %s%s" % (net.short_id, net.name, "  (project %s)" % net.project if net.project else ""))
+        if any(net.project for net in nets):
+            print(c("Compose creates a project's network again on its next Up.", "dim"))
+        if not confirm("Remove %s?" % ("this network" if len(nets) == 1 else "these %d networks" % len(nets))):
+            return False
+    containers = list_containers()[0]
+    ok = True
+    for net in nets:
+        fresh = get_network(net.id)
+        if fresh is None:
+            print(c("%s is already gone." % net.name, "dim"))
+            continue
+        users = network_users(fresh, containers)
+        if users:
+            print(c("%s is now used by %s; skipped." % (net.name, ", ".join(ct.name for ct in users)), "yellow"))
+            ok = False
+            continue
+        r = docker("network", "rm", fresh.id, timeout=60)
+        if r.ok:
+            print(c("Removed network %s" % fresh.name, "green"))
+        else:
+            ok = False
+            print(c("Failed %s: %s" % (fresh.name, r.message()), "red"))
+    pause()
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # Screens: Compose projects
 # --------------------------------------------------------------------------- #
 
@@ -2511,7 +2688,8 @@ def cleanup_screen() -> None:
             header.append(c("Docker did not report disk usage: " + r.message(), "yellow"))
         header.append(c("Volumes are never removed here. Remove a volume on purpose from Volumes.", "dim"))
         key = menu(header, [("1", "Remove stopped containers...", ""), ("2", "Remove unused images...", ""),
-                            ("3", "Clear build cache...", ""), ("4", "Detailed usage (docker system df -v)", "")],
+                            ("3", "Clear build cache...", ""), ("4", "Detailed usage (docker system df -v)", ""),
+                            ("5", "Remove unused networks...", "")],
                    message)
         message = None
         if key == "b":
@@ -2525,6 +2703,8 @@ def cleanup_screen() -> None:
         elif key == "4":
             print("Asking Docker (this can take a while)...")
             page_command(["docker", "system", "df", "-v"], title="docker system df -v")
+        elif key == "5":
+            cleanup_networks()
 
 
 def pick_candidates(title: str, lines: List[str], explain: str) -> Optional[List[int]]:
@@ -2595,6 +2775,21 @@ def cleanup_images() -> None:
     remove_images([unused[i] for i in picked])
 
 
+def cleanup_networks() -> None:
+    nets, _ = list_networks()
+    containers, _ = list_containers()
+    unused = sorted([n for n in nets if not n.builtin and not network_users(n, containers)], key=lambda n: n.name)
+    lines = ["%-32s %s  %-8s %s" % (fit(n.name, 32), n.short_id, n.driver,
+                                    ("project " + n.project) if n.project else "") for n in unused]
+    picked = pick_candidates("Unused networks", lines,
+                             "Networks no container (running or stopped) is attached to. Unlike `docker network "
+                             "prune`, networks of stopped containers are kept, so those containers can start "
+                             "again. Compose recreates a project's network on its next Up.")
+    if not picked:
+        return
+    remove_networks([unused[i] for i in picked])
+
+
 def cleanup_build_cache() -> None:
     rows = parse_json_lines(docker("system", "df", "--format", "{{json .}}", timeout=120).out)
     bc = next((r for r in rows if r.get("Type") == "Build Cache"), {})
@@ -2618,6 +2813,32 @@ def cleanup_build_cache() -> None:
 # --------------------------------------------------------------------------- #
 
 ENDPOINT: Optional[Endpoint] = None
+
+
+def folder_size(path: str, timeout: float = 60) -> Tuple[Optional[int], Optional[str]]:
+    """Bytes used under `path` on its own filesystem (du -skx), or None and a note
+    saying why it could not be measured."""
+    r = run(["du", "-skx", path], timeout=timeout)
+    first = (r.out.split() or [""])[0]
+    size = int(first) * 1024 if first.isdecimal() else None
+    if r.rc == 124:
+        return None, "took longer than %ds; try: sudo du -sxh %s" % (timeout, path)
+    if r.rc == 127:
+        return None, "du is not installed"
+    if not r.ok:
+        if "permission denied" in r.err.lower():
+            return None, "needs root to measure; run dman with sudo"
+        return None, r.message().splitlines()[0]
+    return size, None
+
+
+def disk_space_text(path: str) -> str:
+    try:
+        u = shutil.disk_usage(path)
+    except OSError as e:
+        return "unknown (%s)" % (e.strerror or e)
+    return "%s free of %s (%d%% used)" % (human_bytes(u.free), human_bytes(u.total),
+                                          round(100 * u.used / u.total) if u.total else 0)
 
 
 def system_screen() -> None:
@@ -2649,7 +2870,6 @@ def system_screen() -> None:
         lines += ["Host:            %s" % d.get("Name", "?"),
                   "OS / kernel:     %s / %s" % (d.get("OperatingSystem", "?"), d.get("KernelVersion", "?")),
                   "CPUs / memory:   %s / %s" % (d.get("NCPU", "?"), human_bytes(d.get("MemTotal"))),
-                  "Docker root:     %s" % d.get("DockerRootDir", "?"),
                   "Storage driver:  %s" % d.get("Driver", "?"),
                   "Logging driver:  %s" % d.get("LoggingDriver", "?"),
                   "Cgroup driver:   %s (v%s)" % (d.get("CgroupDriver", "?"), d.get("CgroupVersion", "?")),
@@ -2659,6 +2879,15 @@ def system_screen() -> None:
                   "Images:          %s" % d.get("Images", "?")]
         for w in d.get("Warnings") or []:
             lines.append("Warning:         %s" % w)
+        root = d.get("DockerRootDir")
+        if root:
+            print("Measuring the Docker data folder %s (can take a while)..." % root)
+            size, note = folder_size(root)
+            lines += ["",
+                      "Docker data:     %s" % root,
+                      "  size:          %s%s" % (human_bytes(size) if size is not None else "unknown",
+                                                 "  (" + note + ")" if note else ""),
+                      "  its disk:      %s" % disk_space_text(root)]
     else:
         lines.append("docker info failed: " + info.message())
     lines += ["", "Config file:     %s" % (CFG.path or "none found (looked in %s and %s)" % (USER_CONFIG, SYSTEM_CONFIG)),
@@ -2722,6 +2951,17 @@ Volumes & bind mounts
   Removing a volume deletes its data. dman only offers it for volumes no
   container uses, asks you to type the name, and re-checks right before."""
 
+NETWORKS_HELP = LIST_HELP + """
+
+Networks
+  Every Docker network, its driver and subnet, the Compose project that created
+  it, and the containers attached to it (stopped ones included).
+  bridge, host and none are Docker's built-in networks and cannot be removed.
+  dman only offers to remove networks no container uses, running or stopped:
+  `docker network prune` would also remove the network of a stopped container,
+  which then fails to start. Compose recreates a project's network on its
+  next Up. Disk & cleanup can remove several unused networks at once."""
+
 PROJECTS_HELP = LIST_HELP + """
 
 Compose projects
@@ -2764,7 +3004,8 @@ Main menu
   4 Images             sizes, what uses them, pull, remove
   5 Volumes            volumes and bind mounts, what uses them, remove
   6 Disk & cleanup     docker system df and reviewed cleanup (never volumes)
-  7 System info        versions, endpoint, config in use
+  7 System info        versions, endpoint, Docker data folder size, config in use
+  8 Networks           networks, what uses them, remove unused ones
 
 Everywhere: Enter refreshes, b goes back, m returns to this main menu, q quits,
 h shows help, Ctrl-C at a prompt goes back, and Ctrl-C stops a running command
@@ -2816,7 +3057,7 @@ def preflight() -> Optional[str]:
 def main_menu() -> None:
     screens: Dict[str, Callable[[], None]] = {
         "1": projects_screen, "2": containers_screen, "3": stats_screen, "4": images_screen,
-        "5": volumes_screen, "6": cleanup_screen, "7": system_screen,
+        "5": volumes_screen, "6": cleanup_screen, "7": system_screen, "8": networks_screen,
     }
     message = None
     while True:
@@ -2833,7 +3074,7 @@ def main_menu() -> None:
         key = menu([c("dman", "bold", "cyan") + summary],
                    [("1", "Compose projects", ""), ("2", "Containers", ""), ("3", "Live resource usage", ""),
                     ("4", "Images", ""), ("5", "Volumes & mounts", ""), ("6", "Disk usage & cleanup", ""),
-                    ("7", "System info", ""), ("h", "Help", "")], message, top=True)
+                    ("7", "System info", ""), ("8", "Networks", ""), ("h", "Help", "")], message, top=True)
         message = None
         if key in screens:
             try:
