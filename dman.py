@@ -536,6 +536,7 @@ class Container:
     restart: str
     networks: List[str]
     restart_count: int = 0           # restarts by the restart policy since the last manual start
+    host_ports: List[int] = field(default_factory=list)   # published host ports, ascending
     raw: Dict[str, Any] = field(repr=False, default_factory=dict)
 
     @property
@@ -582,25 +583,32 @@ class Container:
 
 
 def format_ports(ports: Optional[Dict[str, Any]]) -> List[str]:
-    """{'80/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '8080'}]} -> ['8080->80']"""
-    out: List[str] = []
+    """{'80/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '8080'}]} -> ['8080->80'], ordered by host port."""
+    found: List[Tuple[int, int, str]] = []
 
-    def sort_key(item: Tuple[str, Any]) -> Tuple[int, str]:
-        num = item[0].split("/")[0]
-        return (int(num) if num.isdecimal() else 0, item[0])
+    def number(text: str) -> int:
+        return int(text) if text.isdecimal() else 0
 
-    for cport, binds in sorted((ports or {}).items(), key=sort_key):
+    for cport, binds in (ports or {}).items():
         if not binds:
             continue
         num, _, proto = cport.partition("/")
         for b in binds:
             ip = (b or {}).get("HostIp", "")
-            hp = (b or {}).get("HostPort", "")
+            hp = str((b or {}).get("HostPort", ""))
             text = ("" if ip in ("", "0.0.0.0", "::") else (("[%s]" % ip if ":" in ip else ip) + ":"))
             text += "%s->%s" % (hp, num) + ("" if proto in ("", "tcp") else "/" + proto)
-            if text not in out:
-                out.append(text)
-    return out
+            if text not in (t for _, _, t in found):
+                found.append((number(hp), number(num), text))
+    return [t for _, _, t in sorted(found)]
+
+
+def host_ports(ports: Optional[Dict[str, Any]]) -> List[int]:
+    """{'80/tcp': [{'HostIp': '0.0.0.0', 'HostPort': '8080'}]} -> [8080]: the ports published
+    on the host (not the container's own), each once, ascending."""
+    found = {int(b["HostPort"]) for binds in (ports or {}).values() for b in (binds or [])
+             if str((b or {}).get("HostPort", "")).isdecimal()}
+    return sorted(found)
 
 
 def container_from_inspect(d: Dict[str, Any]) -> Container:
@@ -627,6 +635,7 @@ def container_from_inspect(d: Dict[str, Any]) -> Container:
         restart=(host.get("RestartPolicy") or {}).get("Name") or "no",
         networks=sorted((net.get("Networks") or {}).keys()),
         restart_count=int(d.get("RestartCount") or 0),
+        host_ports=host_ports(net.get("Ports")),
         raw=d,
     )
 
@@ -1476,6 +1485,7 @@ def container_sorts() -> List[Tuple[str, Callable[[List[Container]], List[Contai
         ("name", lambda xs: sorted(xs, key=lambda x: x.name)),
         ("project", lambda xs: sorted(xs, key=lambda x: (x.project == "", x.project, x.service, x.name))),
         ("newest", lambda xs: sorted(xs, key=lambda x: x.created or datetime.min.replace(tzinfo=timezone.utc), reverse=True)),
+        ("host port", lambda xs: sorted(xs, key=lambda x: (not x.host_ports, x.host_ports, x.name))),
     ]
 
 
@@ -2915,8 +2925,10 @@ CONTAINERS_HELP = LIST_HELP + """
 Containers
   Lists every container, running or stopped. STATE shows the exit code for
   stopped containers and the health status when the image defines a check.
-  PORTS shows published ports as host->container (an IP prefix means the port
-  is only published on that address).
+  PORTS shows published ports as host->container, lowest host port first (an IP
+  prefix means the port is only published on that address).
+  Sort 'host port' orders by the host side (the 8080 in 8080->80), lowest
+  first; containers that publish no port, which includes stopped ones, come last.
   STATE also shows how often the restart policy has restarted a container since
   it was last started by hand; a running container with restarts is yellow,
   which usually means it keeps crashing. A container stuck in a crash loop shows
