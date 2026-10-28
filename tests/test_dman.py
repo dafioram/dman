@@ -63,8 +63,23 @@ class ParsingTests(unittest.TestCase):
             "443/tcp": None,
         }
         self.assertEqual(dman.format_ports(ports), ["53->53/udp", "8080->80", "127.0.0.1:9090->90"])
+        swapped = {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "9000"}],
+                   "8443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "81"}]}
+        self.assertEqual(dman.format_ports(swapped), ["81->8443", "9000->80"])
         self.assertEqual(dman.format_ports({}), [])
         self.assertEqual(dman.format_ports(None), [])
+
+    def test_host_ports(self):
+        ports = {
+            "90/tcp": [{"HostIp": "127.0.0.1", "HostPort": "9090"}],
+            "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}, {"HostIp": "::", "HostPort": "8080"}],
+            "53/udp": [{"HostIp": "", "HostPort": "53"}],
+            "443/tcp": None,
+            "22/tcp": [{"HostIp": "0.0.0.0", "HostPort": ""}],
+        }
+        self.assertEqual(dman.host_ports(ports), [53, 8080, 9090])
+        self.assertEqual(dman.host_ports({}), [])
+        self.assertEqual(dman.host_ports(None), [])
 
     def test_json_helpers(self):
         self.assertEqual(dman.parse_json_array('[{"a":1}]'), [{"a": 1}])
@@ -491,6 +506,21 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(project(ok, down).status, "partial")
         self.assertEqual(project(down).status, "stopped")
         self.assertEqual(dman.project_style(project(loop)), ("red",))
+
+    def test_sort_by_host_port(self):
+        def ct(name, ports, state="running"):
+            c = make_container(name, state=state)
+            c.host_ports = ports
+            return c
+        cts = [ct("web", [443, 8080]), ct("zz-none", []), ct("dns", [53]), ct("api", [8080]),
+               ct("aa-stopped", [], state="exited"), ct("proxy", [80, 443])]
+        sort = dict(dman.container_sorts())["host port"]
+        self.assertEqual([c.name for c in sort(cts)], ["dns", "proxy", "web", "api", "aa-stopped", "zz-none"])
+        self.assertEqual([label for label, _ in dman.container_sorts()],
+                         ["running first", "name", "project", "newest", "host port"])
+        raw = dict(make_container("x").raw)
+        raw["NetworkSettings"] = {"Ports": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8081"}]}}
+        self.assertEqual(dman.container_from_inspect(raw).host_ports, [8081])
 
     def test_mount_rows(self):
         vol = dman.Volume("data", "local", "/var/lib/docker/volumes/data/_data", None, {dman.L_PROJECT: "p"})
