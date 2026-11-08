@@ -119,15 +119,18 @@ and `/opt/docker/group/app/compose.yaml` are found. Hidden folders and `node_mod
   project shows `pick files`; open it and use **Choose compose files** (the choice
   lasts until dman exits; once deployed, the files used are remembered by Docker).
 - A project that is running or has stopped containers is matched to its folder through
-  the labels Compose puts on containers, and its actions use exactly the files it was
-  deployed with.
+  Compose's container labels. If any deployed file is missing, dman requires an
+  explicit file selection before Up. Use **Choose compose files** in a configured
+  project folder to select a replacement. Compose uses the current environment
+  and profiles for the selected files.
 - Projects started from a folder outside your configured folders still appear while
   their containers exist. If their compose files are gone, they show `(no file)`:
   status, logs, start/stop/restart and Down still work; Up and anything that needs the
   file are disabled.
-- A project in your folders that has never been started shows `not deployed` and can
-  be started with **Up**. Its name is guessed from the folder; Compose has the final
-  say (for example a `name:` in the file).
+- A project in your folders that has never been started shows `not deployed`.
+  The list shows a name guessed from the folder. Before **Up**, dman asks Compose
+  for the effective name, checks for an existing deployment with that name,
+  and shows the resolved name in the confirmation.
 
 ## Safety
 
@@ -141,12 +144,15 @@ and `/opt/docker/group/app/compose.yaml` are found. Hidden folders and `node_mod
   Right before running, dman checks the targets again; if anything changed (a container
   started, a volume became used, a project gained a container), it cancels and asks you
   to review again.
-- **Down + remove volumes** (`docker compose down -v`) lists the volumes it will
-  delete, says when it cannot be sure, and needs the project name typed. It is never
-  run as part of anything else, and plain **Down** never turns into it.
+- **Down + remove volumes** (`docker compose down -v`) requires a complete
+  preview and the project name typed. It rechecks the configuration and volume
+  inventory after confirmation. Plain **Down** keeps volumes, but removes the
+  containers' writable layers, and a later Up does not automatically reattach
+  anonymous volumes.
 - **Volumes** are only deleted by explicit volume actions: the volume screen (unused
   volumes only, typed name) or Down + remove volumes.
-- **Secrets.** Environment views hide values until you ask to reveal them. Raw inspect
+- **Secrets.** The project Environment view shows service variables resolved by
+  Compose. Environment views hide values until you ask to reveal them. Raw inspect
   and the resolved Compose config ask first, since they contain values too.
 - **Terminal output.** Text that comes from Docker or from files (names, labels, health
   check output, compose files, error messages) has control characters removed before

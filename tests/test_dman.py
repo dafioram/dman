@@ -8,7 +8,9 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import timezone
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import dman  # noqa: E402
@@ -93,16 +95,6 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(dman.parse_selection("4-2", 5), [1, 2, 3])
         for bad in ["", "0", "6", "1-9", "x", "1 two", "\u00b2", "1 \u00b3"]:
             self.assertIsNone(dman.parse_selection(bad, 5), bad)
-
-    def test_dotenv(self):
-        with tempfile.TemporaryDirectory() as d:
-            p = os.path.join(d, ".env")
-            with open(p, "w") as fh:
-                fh.write("# c\nA=1\nexport B='two words'\nC=\"x\"\nnot a pair\n\n")
-            pairs, err = dman.read_dotenv(p)
-            self.assertIsNone(err)
-            self.assertEqual(pairs, [("A", "1"), ("B", "two words"), ("C", "x")])
-            self.assertEqual(dman.read_dotenv(os.path.join(d, "missing")), (None, None))
 
     def test_redaction_default(self):
         lines = dman.redacted_lines([("PASSWORD", "hunter2"), ("EMPTY", "")], reveal=False)
@@ -231,6 +223,24 @@ class DiscoveryTests(unittest.TestCase):
                                 folder_files=[], files=None, files_how="", containers=[])
         self.assertEqual(dman.compose_base(labelled), ["docker", "compose", "-p", "p"])
 
+    def test_missing_deployed_override_requires_explicit_replacement(self):
+        web_dir = os.path.join(self.root, "web")
+        base = os.path.join(web_dir, "compose.yaml")
+        override = os.path.join(web_dir, "compose.override.yaml")
+        ct = make_container("web-app-1", labels={dman.L_PROJECT: "web", dman.L_WORKDIR: web_dir,
+                                                 dman.L_FILES: ",".join([base, override])})
+        cfg = cfg_with([self.root])
+        os.unlink(override)
+        projects, _ = dman.build_projects([ct], cfg)
+        web = next(p for p in projects if p.name == "web")
+        self.assertFalse(web.can_up)
+        self.assertEqual(web.folder_files, ["compose.yaml"])
+        with patch.dict(dman.CHOSEN_FILES, {web.key: [base]}):
+            projects, _ = dman.build_projects([ct], cfg)
+            web = next(p for p in projects if p.name == "web")
+            self.assertTrue(web.can_up)
+            self.assertEqual(web.files_how, "chosen")
+
 
 class DownVolumesImpactTests(unittest.TestCase):
     def test_impact(self):
@@ -290,6 +300,124 @@ class EndpointTests(unittest.TestCase):
 
 
 class ProjectWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = self.tmp.name
+        self.file = os.path.join(self.directory, "compose.yaml")
+        self.p = dman.Project("folder:example", "guessed", False, self.directory, ["compose.yaml"],
+                              [self.file], "default", [])
+        self.live = dman.Project("project:live", "live", True, self.directory, ["compose.yaml"],
+                                 [self.file], "deployed", [make_container("live-app-1")])
+
+    def test_up_pins_the_resolved_name_and_checks_for_collisions(self):
+        with patch.object(dman, "load_projects", return_value=([self.p], None, [])) as projects, \
+             patch.object(dman, "compose_config_json", return_value=({"name": "live"}, None)), \
+             patch.object(dman, "confirm", return_value=True) as confirm, \
+             patch.object(dman, "run_fg", return_value=0) as launch, \
+             patch.object(dman, "pause"), redirect_stdout(io.StringIO()) as out:
+            dman.compose_run(self.p, [["up", "-d"]], "Deploy")
+            launch.assert_called_once_with(dman.compose_base(self.p) + ["-p", "live", "up", "-d"],
+                                           cwd=self.directory)
+            self.assertIn("Run on project live?", confirm.call_args.args[0])
+            launch.reset_mock()
+            confirm.reset_mock()
+            projects.return_value = ([self.p, self.live], None, [])
+            dman.compose_run(self.p, [["up", "-d"]], "Deploy")
+            self.assertIn("already deployed", out.getvalue())
+            launch.assert_not_called()
+            confirm.assert_not_called()
+
+    def test_down_checks_again_after_confirmation(self):
+        replacement = dman.replace(self.live, containers=[make_container("replacement")])
+        with patch.object(dman, "load_projects", side_effect=[([self.live], None, []),
+                                                               ([replacement], None, [])]), \
+             patch.object(dman, "compose_config_json", return_value=({"name": "live"}, None)), \
+             patch.object(dman, "confirm", return_value=True), patch.object(dman, "pause"), \
+             patch.object(dman, "run_fg") as launch, redirect_stdout(io.StringIO()) as out:
+            dman.compose_run(self.live, [["down"]], "Remove")
+            launch.assert_not_called()
+            self.assertIn("project changed", out.getvalue())
+
+    def test_up_rechecks_for_collisions_before_launch(self):
+        inventories = [([self.p], None, []), ([self.p, self.live], None, [])]
+        with patch.object(dman, "load_projects", side_effect=inventories), \
+             patch.object(dman, "compose_config_json", return_value=({"name": "live"}, None)), \
+             patch.object(dman, "confirm", return_value=True) as confirm, patch.object(dman, "pause"), \
+             patch.object(dman, "run_fg") as launch, redirect_stdout(io.StringIO()) as out:
+            dman.compose_run(self.p, [["up", "-d"]], "Deploy")
+            confirm.assert_called_once()
+            launch.assert_not_called()
+            self.assertIn("already deployed", out.getvalue())
+
+    def test_volume_down_rejects_incomplete_preview_and_recheck(self):
+        model = {"name": "live", "volumes": {"db": {"name": "live_db"}}}
+        vol = dman.Volume("live_db", "local", "/db", None, {})
+        available = ([vol], None)
+        unavailable = ([], "volume list failed")
+        for results, prompts in [([unavailable], 0), ([available, unavailable], 1)]:
+            with self.subTest(prompts=prompts), \
+                 patch.object(dman, "load_projects", return_value=([self.live], None, [])), \
+                 patch.object(dman, "compose_config_json", return_value=(model, None)), \
+                 patch.object(dman, "list_volumes", side_effect=results), \
+                 patch.object(dman, "typed_confirm", return_value=True) as confirm, \
+                 patch.object(dman, "run_fg") as launch, patch.object(dman, "pause"), \
+                 redirect_stdout(io.StringIO()) as out:
+                dman.down_with_volumes(self.live)
+                self.assertEqual(confirm.call_count, prompts)
+                self.assertIn("volume list failed", out.getvalue())
+                launch.assert_not_called()
+
+    def test_volume_down_with_complete_preview(self):
+        model = {"name": "live", "volumes": {"db": {"name": "live_db"}}}
+        vol = dman.Volume("live_db", "local", "/db", None, {})
+        with patch.object(dman, "load_projects", return_value=([self.live], None, [])), \
+             patch.object(dman, "compose_config_json", return_value=(model, None)), \
+             patch.object(dman, "list_volumes", return_value=([vol], None)), \
+             patch.object(dman, "typed_confirm", return_value=True), \
+             patch.object(dman, "run_fg", return_value=0) as launch, patch.object(dman, "pause"), \
+             redirect_stdout(io.StringIO()) as out:
+            dman.down_with_volumes(self.live)
+            self.assertIn("live_db", out.getvalue())
+            launch.assert_called_once_with(dman.compose_base(self.live) + ["down", "-v"], cwd=self.directory)
+
+    def test_partial_container_inspect_reports_an_error(self):
+        with patch.object(dman, "docker", side_effect=[dman.Result(0, "aa bb\n", ""),
+                                                      dman.Result(1, '[{"Id":"aa"}]', "inspect failed")]):
+            containers, error = dman.list_containers()
+        self.assertEqual([ct.id for ct in containers], ["aa"])
+        self.assertEqual(error, "inspect failed")
+
+    def test_volume_removal_rejects_replacement_with_same_name(self):
+        vol = dman.Volume("data", "local", "/data", None, {}, {"CreatedAt": "first"})
+        replacement = dman.replace(vol, raw={"CreatedAt": "second"})
+        row, = dman.build_mount_rows([vol], [])
+        with patch.object(dman, "list_volumes", return_value=([replacement], None)), \
+             patch.object(dman, "list_containers", return_value=([], None)), \
+             patch.object(dman, "typed_confirm", return_value=True), patch.object(dman, "pause"), \
+             patch.object(dman, "docker") as docker, redirect_stdout(io.StringIO()):
+            self.assertFalse(dman.remove_volume(row))
+        docker.assert_not_called()
+
+    def test_status_displays_docker_error(self):
+        with patch.object(dman, "find_project", return_value=self.live), \
+             patch.object(dman, "menu", side_effect=["1", "b"]), \
+             patch.object(dman, "run", return_value=dman.Result(1, "", "Docker unavailable")), \
+             patch.object(dman, "show_text") as show:
+            dman.project_view(self.live.key)
+        show.assert_called_once_with("Docker unavailable", "Status: live")
+
+    def test_project_environment_hides_multiline_value(self):
+        secret = "value\nsecret-fragment=second-line"
+        with open(os.path.join(self.directory, ".env"), "w") as fh:
+            fh.write("TOKEN='" + secret + "'\n")
+        config = {"services": {"web": {"environment": {"TOKEN": secret}}}}
+        with patch.object(dman, "compose_config_json", return_value=(config, None)), \
+             patch.object(dman, "ask", return_value="b"), redirect_stdout(io.StringIO()) as out:
+            dman.project_env(self.p)
+        self.assertIn("TOKEN=<hidden>", out.getvalue())
+        self.assertNotIn("secret-fragment", out.getvalue())
+
     def test_service_names_without_files(self):
         cts = [make_container("p-web-1", labels={dman.L_PROJECT: "p", dman.L_SERVICE: "web"}),
                make_container("p-db-1", labels={dman.L_PROJECT: "p", dman.L_SERVICE: "db"})]
@@ -504,6 +632,7 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(project(ok, loop).status, "restarting")
         self.assertEqual(project(loop).status, "restarting")
         self.assertEqual(project(ok, down).status, "partial")
+        self.assertEqual(project(sick, down).status, "unhealthy")
         self.assertEqual(project(down).status, "stopped")
         self.assertEqual(dman.project_style(project(loop)), ("red",))
 

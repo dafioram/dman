@@ -23,7 +23,7 @@ import signal
 import stat
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -446,16 +446,20 @@ def parse_json_lines(text: str) -> List[Dict[str, Any]]:
 
 
 def inspect_many(kind: Sequence[str], ids: Sequence[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """Batch `docker <kind> inspect`. Objects that vanished in the meantime are skipped."""
+    """Batch inspect, retaining partial results and reporting incomplete batches."""
     items: List[Dict[str, Any]] = []
     errors: List[str] = []
     ids = list(ids)
     for i in range(0, len(ids), 100):
-        r = docker(*kind, *ids[i:i + 100])
+        batch = ids[i:i + 100]
+        r = docker(*kind, *batch)
         found = parse_json_array(r.out)
         items.extend(found)
-        if not r.ok and not found:
+        if not r.ok:
             errors.append(r.message())
+        elif len(found) != len(batch):
+            errors.append("Incomplete Docker %s output (%d of %d results)." %
+                          (" ".join(kind), len(found), len(batch)))
     return items, ("; ".join(errors) if errors else None)
 
 
@@ -1001,8 +1005,10 @@ class Project:
             return "not deployed" if self.files else "pick files"
         if any(ct.state == "restarting" for ct in self.containers):
             return "restarting"
+        if any(ct.running and ct.health == "unhealthy" for ct in self.containers):
+            return "unhealthy"
         if self.running == len(self.containers):
-            return "unhealthy" if any(ct.health == "unhealthy" for ct in self.containers) else "running"
+            return "running"
         return "partial" if self.running else "stopped"
 
     @property
@@ -1048,7 +1054,11 @@ def build_projects(containers: Sequence[Container], cfg: Config) -> Tuple[List[P
         if folder:
             used.add(folder.path)
         if p.key in CHOSEN_FILES:
-            p.files, p.files_how = CHOSEN_FILES[p.key], "chosen"
+            chosen = CHOSEN_FILES[p.key]
+            if all(os.path.isfile(f) for f in chosen):
+                p.files, p.files_how = chosen, "chosen"
+            else:
+                p.problems.append("selected compose files are missing; choose files again")
         elif label_files and all(os.path.isfile(f) for f in label_files):
             p.files, p.files_how = label_files, "deployed"
         else:
@@ -1057,10 +1067,8 @@ def build_projects(containers: Sequence[Container], cfg: Config) -> Tuple[List[P
                 p.problems.append("compose file(s) used at deploy time are missing: " + ", ".join(missing))
             if not workdir:
                 p.problems.append("containers carry no Compose working-directory label")
-            if folder:
-                default = default_file_set(folder.files)
-                if default:
-                    p.files, p.files_how = [os.path.join(folder.path, n) for n in default], "default"
+            if not label_files:
+                p.problems.append("containers carry no Compose file labels")
         projects.append(p)
 
     for folder in folders:
@@ -1071,7 +1079,11 @@ def build_projects(containers: Sequence[Container], cfg: Config) -> Tuple[List[P
                     name_known=False, directory=folder.path, folder_files=folder.files,
                     files=None, files_how="", containers=[])
         if key in CHOSEN_FILES:
-            p.files, p.files_how = CHOSEN_FILES[key], "chosen"
+            chosen = CHOSEN_FILES[key]
+            if all(os.path.isfile(f) for f in chosen):
+                p.files, p.files_how = chosen, "chosen"
+            else:
+                p.problems.append("selected compose files are missing; choose files again")
         else:
             default = default_file_set(folder.files)
             if default:
@@ -1116,10 +1128,11 @@ def compose_cwd(p: Project) -> Optional[str]:
     return p.directory if p.directory_ok else None
 
 
-def compose_config_json(p: Project) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def compose_config_json(p: Project, *, no_env_resolution: bool = False) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not p.files:
         return None, "no compose files"
-    r = run(compose_base(p) + ["config", "--format", "json"], cwd=compose_cwd(p), timeout=60)
+    flags = ["--no-env-resolution"] if no_env_resolution else []
+    r = run(compose_base(p) + ["config", "--format", "json"] + flags, cwd=compose_cwd(p), timeout=60)
     if not r.ok:
         return None, r.message()
     try:
@@ -1127,6 +1140,40 @@ def compose_config_json(p: Project) -> Tuple[Optional[Dict[str, Any]], Optional[
         return (data, None) if isinstance(data, dict) else (None, "unexpected output")
     except ValueError:
         return None, "could not parse `docker compose config` output"
+
+
+def project_snapshot(p: Project) -> Tuple[Any, ...]:
+    return (p.name, p.directory, p.directory_ok, tuple(p.files or []),
+            tuple(sorted((ct.id, ct.state, ct.labels.get(L_WORKDIR, ""), ct.labels.get(L_FILES, ""))
+                         for ct in p.containers)))
+
+
+def check_compose_action(p: Project, *, deploy: bool = False, down: bool = False
+                         ) -> Tuple[Optional[Project], Optional[Dict[str, Any]], Optional[str]]:
+    projects, error, _ = load_projects()
+    if error:
+        return None, None, "Could not verify the Docker inventory: " + error
+    fresh = next((item for item in projects if item.key == p.key), None)
+    if fresh is None or project_snapshot(fresh) != project_snapshot(p):
+        return None, None, "The project changed. Refresh and review it again."
+    workdirs = {os.path.realpath(ct.labels[L_WORKDIR]) for ct in fresh.containers if ct.labels.get(L_WORKDIR)}
+    if len(workdirs) > 1:
+        return None, None, "Containers for this project name come from different directories."
+    model = None
+    if deploy or (down and fresh.files):
+        model, error = compose_config_json(fresh, no_env_resolution=down)
+        if model is None:
+            return None, None, "Could not resolve the Compose configuration: " + (error or "unknown error")
+    if deploy and not fresh.name_known:
+        name = (model or {}).get("name")
+        if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+            return None, None, "Compose did not return a valid project name."
+        existing = next((item for item in projects if item.name_known and item.name == name), None)
+        if existing is not None:
+            return None, None, "Compose project %s is already deployed (%s). Use its deployed entry." % (
+                name, existing.directory or "directory unknown")
+        fresh = replace(fresh, name=name, name_known=True)
+    return fresh, model, None
 
 
 # --------------------------------------------------------------------------- #
@@ -1428,30 +1475,6 @@ def split_env(entries: Sequence[str]) -> List[Tuple[str, str]]:
         k, _, v = e.partition("=")
         out.append((k, v))
     return out
-
-
-def read_dotenv(path: str) -> Tuple[Optional[List[Tuple[str, str]]], Optional[str]]:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            lines = fh.read().splitlines()
-    except FileNotFoundError:
-        return None, None
-    except OSError as e:
-        return None, "cannot read %s: %s" % (path, e.strerror or e)
-    pairs = []
-    for line in lines:
-        s = line.strip()
-        if not s or s.startswith("#"):
-            continue
-        if s.startswith("export "):
-            s = s[7:].lstrip()
-        k, sep, v = s.partition("=")
-        if sep:
-            v = v.strip()
-            if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
-                v = v[1:-1]
-            pairs.append((k.strip(), v))
-    return pairs, None
 
 
 # --------------------------------------------------------------------------- #
@@ -2094,13 +2117,21 @@ def remove_volume(row: MountRow) -> bool:
         print("Cancelled.")
         pause()
         return False
-    vols, _ = list_volumes()
-    cts, _ = list_containers()
+    vols, vol_error = list_volumes()
+    cts, container_error = list_containers()
+    if vol_error or container_error:
+        print(c("Could not verify the Docker inventory: " + (vol_error or container_error or ""), "yellow"))
+        pause()
+        return False
     fresh = next((r for r in build_mount_rows(vols, cts) if r.kind == "volume" and r.name == row.name), None)
     if fresh is None:
         print(c("It is already gone.", "yellow"))
         pause()
         return True
+    if fresh.volume != row.volume:
+        print(c("The volume changed since you reviewed it. Review it again.", "yellow"))
+        pause()
+        return False
     if fresh.users:
         print(c("A container now uses it (%s). Nothing was removed." % ", ".join(u.container.name for u in fresh.users), "yellow"))
         pause()
@@ -2337,7 +2368,7 @@ def project_view(key: str) -> None:
             opts.append(("11", "Containers", ""))
         if p.files:
             opts += [("12", "View compose file(s)", ""), ("13", "Resolved config", ""), ("14", "Environment", "")]
-        if len(p.folder_files) > 1 or (not p.files and p.folder_files):
+        if len(p.folder_files) > 1 or (p.folder_files and (not p.files or p.files_how == "chosen")):
             opts.append(("15", "Choose compose files", ""))
         if len(p.services()) > 1:
             opts.append(("16", "One service...", ""))
@@ -2351,7 +2382,8 @@ def project_view(key: str) -> None:
             continue
         base, cwd = compose_base(p), compose_cwd(p)
         if key_in == "1":
-            show_text(run(base + ["ps", "-a"], cwd=cwd).out or "(no containers)", "Status: " + p.name)
+            r = run(base + ["ps", "-a"], cwd=cwd)
+            show_text((r.out or "(no containers)") if r.ok else r.message(), "Status: " + p.name)
         elif key_in == "2":
             compose_run(p, [["up", "-d"]], "Creates or recreates containers so they match the compose file.")
         elif key_in == "3":
@@ -2369,8 +2401,9 @@ def project_view(key: str) -> None:
         elif key_in == "8":
             project_logs(p)
         elif key_in == "9":
-            compose_run(p, [["down"]], "Stops and REMOVES the project's containers and its default network. "
-                                       "Named volumes are kept, so data survives the next Up.", default_yes=False)
+            compose_run(p, [["down"]], "Stops and removes project containers and Compose-managed networks. "
+                        "Named volumes and bind-mounted data are kept. Container writable layers are lost, "
+                        "and the next Up does not automatically reattach anonymous volumes.", default_yes=False)
         elif key_in == "10":
             down_with_volumes(p)
         elif key_in == "11":
@@ -2392,17 +2425,35 @@ def project_view(key: str) -> None:
 
 def compose_run(p: Project, steps: List[List[str]], explain: str, ask_first: bool = True,
                 default_yes: bool = True) -> None:
-    base, cwd = compose_base(p), compose_cwd(p)
+    deploy = any(step[0] == "up" for step in steps)
+    down = any(step[0] == "down" for step in steps)
+    target, model = p, None
+    if deploy or down:
+        fresh, model, error = check_compose_action(p, deploy=deploy, down=down)
+        if fresh is None:
+            print(c(error or "Could not verify the Compose project.", "yellow"))
+            pause()
+            return
+        target = fresh
+    base, cwd = compose_base(target), compose_cwd(target)
     clear()
-    title_line("%s: %s" % (p.name, " + ".join(" ".join(s) for s in steps)))
+    title_line("%s: %s" % (target.name, " + ".join(" ".join(s) for s in steps)))
     print(explain)
     print(c("\nFolder:  %s" % (cwd or "-"), "dim"))
+    if down:
+        print(c("Project containers reviewed: " + (", ".join(ct.label() for ct in target.containers) or "(none)"), "dim"))
     for s in steps:
         print(c("Command: " + shlex.join(base + s), "dim"))
-    if ask_first and not confirm("\nRun on project %s?" % p.name, default=default_yes):
+    if ask_first and not confirm("\nRun on project %s?" % target.name, default=default_yes):
         return
     print()
     for i, s in enumerate(steps):
+        if deploy or down:
+            fresh, fresh_model, error = check_compose_action(p, deploy=deploy, down=down)
+            if fresh is None or compose_base(fresh) != base or fresh_model != model:
+                print(c(error or "The Compose configuration changed. Review it again.", "yellow"))
+                pause()
+                return
         rc = run_fg(base + s, cwd=cwd)
         if rc != 0 and i < len(steps) - 1:
             report_rc(rc)
@@ -2539,7 +2590,7 @@ class VolumeImpact:
     notes: List[str]
 
     def snapshot(self) -> Tuple[Any, ...]:
-        return tuple(sorted(self.remove)), tuple(sorted(self.anonymous)), self.certain
+        return tuple(self.remove), tuple(self.absent), tuple(self.external), tuple(self.anonymous), self.certain
 
 
 def volume_impact(p: Project, cfg: Optional[Dict[str, Any]], cfg_err: Optional[str],
@@ -2547,8 +2598,7 @@ def volume_impact(p: Project, cfg: Optional[Dict[str, Any]], cfg_err: Optional[s
     declared, external, notes = [], [], []
     certain = cfg is not None
     if cfg is None:
-        notes.append("Could not read the compose config (%s). Compose will still remove every "
-                     "non-external volume the file declares." % (cfg_err or "unknown error"))
+        notes.append("Could not read the Compose config: " + (cfg_err or "unknown error"))
     else:
         for key, spec in (cfg.get("volumes") or {}).items():
             spec = spec or {}
@@ -2564,27 +2614,46 @@ def volume_impact(p: Project, cfg: Optional[Dict[str, Any]], cfg_err: Optional[s
 
 def current_impact(p: Project) -> Tuple[VolumeImpact, Tuple[Any, ...]]:
     cfg, err = compose_config_json(p)
-    r = docker("volume", "ls", "-q")
-    impact = volume_impact(p, cfg, err, r.out.split() if r.ok else [])
-    snap = (p.name, tuple(p.files or []), tuple(sorted(ct.id for ct in p.containers))) + impact.snapshot()
+    volumes, volume_error = list_volumes()
+    impact = volume_impact(p, cfg, err, [vol.name for vol in volumes])
+    if volume_error:
+        impact.certain = False
+        impact.notes.append("Could not verify the Docker volume inventory: " + volume_error)
+    candidates = set(impact.remove + impact.anonymous)
+    identities = sorted((vol for vol in volumes if vol.name in candidates), key=lambda vol: vol.name)
+    if not set(impact.anonymous).issubset(vol.name for vol in volumes):
+        impact.certain = False
+        impact.notes.append("At least one attached volume is missing from the Docker inventory.")
+    snap = (project_snapshot(p), cfg, identities) + impact.snapshot()
     return impact, snap
 
 
 def down_with_volumes(p: Project) -> None:
-    impact, snap = current_impact(p)
+    fresh, _, error = check_compose_action(p)
+    if fresh is None:
+        print(c(error or "Could not verify the Compose project.", "yellow"))
+        pause()
+        return
+    impact, snap = current_impact(fresh)
+    if not impact.certain:
+        print(c("Down with volumes requires a complete preview.", "yellow"))
+        for note in impact.notes:
+            print(c(note, "yellow"))
+        pause()
+        return
     clear()
     print(c("DOWN + REMOVE VOLUMES: %s" % p.name, "bold", "red"))
     print("Stops and removes the project's containers and network, AND deletes its volumes.")
     print(c("Data in these volumes (databases, uploads, app state) is gone for good. "
             "Running Up again creates empty volumes; it does not bring the data back.", "red"))
     print()
-    print("Volumes that will be deleted:")
+    print("Volumes Compose may delete:")
     for n in impact.remove:
         print("  " + c(n, "bold"))
     for n in impact.anonymous:
-        print("  %s %s" % (n[:12], c("(anonymous, attached to a project container)", "dim")))
+        print("  %s %s" % (n, c("(anonymous, attached to a project container)", "dim")))
     if not impact.remove and not impact.anonymous:
-        print("  (none found)" if impact.certain else "  (unknown)")
+        print("  (none found)")
     if impact.absent:
         print(c("Declared but not present: " + ", ".join(impact.absent), "dim"))
     if impact.external:
@@ -2597,15 +2666,17 @@ def down_with_volumes(p: Project) -> None:
         print("Cancelled. Nothing was changed.")
         pause()
         return
-    fresh = find_project(p.key)
-    if fresh is None or fresh.key != p.key:
-        print(c("The project changed (it is no longer found). Nothing was run.", "yellow"))
+    fresh, _, error = check_compose_action(p)
+    if fresh is None:
+        print(c(error or "Could not verify the Compose project.", "yellow"))
         pause()
         return
-    _, fresh_snap = current_impact(fresh)
-    if fresh_snap != snap:
+    fresh_impact, fresh_snap = current_impact(fresh)
+    if not fresh_impact.certain or fresh_snap != snap:
         print(c("The project or its volumes changed since you reviewed them. Nothing was run; "
                 "open this action again to review the new state.", "yellow"))
+        for note in fresh_impact.notes:
+            print(c(note, "yellow"))
         pause()
         return
     print()
@@ -2628,21 +2699,12 @@ def show_compose_files(p: Project) -> None:
 
 def project_env(p: Project) -> None:
     sections: List[Tuple[str, List[Tuple[str, str]]]] = []
-    note = (".env in the project folder fills in ${VARIABLES} in the compose file. Its values are "
-            "not passed into containers unless a service lists them under environment: or env_file:.")
-    if p.directory:
-        dotenv = os.path.join(p.directory, ".env")
-        pairs, err = read_dotenv(dotenv)
-        if err:
-            sections.append((dotenv + " (" + err + ")", []))
-        elif pairs is None:
-            sections.append((dotenv + " (not present)", []))
-        else:
-            sections.append((dotenv, pairs))
     print("Reading compose config...")
-    cfg, err = compose_config_json(p)
+    cfg, _ = compose_config_json(p)
     if cfg is None:
-        sections.append(("Service environment (unavailable: %s)" % err, []))
+        print(c("Compose could not resolve the service environment.", "yellow"))
+        pause()
+        return
     else:
         for svc, spec in sorted((cfg.get("services") or {}).items()):
             env = (spec or {}).get("environment") or {}
@@ -2651,7 +2713,7 @@ def project_env(p: Project) -> None:
             else:
                 pairs = [(k, "" if v is None else str(v)) for k, v in sorted(env.items())]
             sections.append(("Service %s (environment + env_file, resolved)" % svc, pairs))
-    show_env("Environment: " + p.name, sections, note)
+    show_env("Environment: " + p.name, sections, "Shows the service environment resolved by Compose.")
 
 
 def choose_files(p: Project) -> None:

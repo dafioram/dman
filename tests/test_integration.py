@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import dman  # noqa: E402
@@ -46,7 +47,7 @@ class ComposeProjectTests(unittest.TestCase):
     def setUpClass(cls):
         problem = dman.preflight()
         if problem:
-            raise unittest.SkipTest("Docker is not usable here: " + problem)
+            raise RuntimeError("Docker is not usable here: " + problem)
         cls.tmp = tempfile.mkdtemp()
         cls.name = "dman-it-" + uuid.uuid4().hex[:8]
         cls.folder = os.path.join(cls.tmp, cls.name)
@@ -112,8 +113,10 @@ class ComposeProjectTests(unittest.TestCase):
         self.assertEqual([u.id for u in dman.network_users(net, dman.list_containers()[0])], [ct.id])
         self.assertTrue(by_name["bridge"].builtin)
 
-        r = dman.run(dman.compose_base(p) + ["down", "-v"], cwd=dman.compose_cwd(p), timeout=120)
-        self.assertTrue(r.ok, r.message())
+        with patch.object(dman, "CFG", self.cfg), patch.object(dman, "typed_confirm", return_value=True), \
+             patch.object(dman, "pause"), patch.object(dman, "run_fg", wraps=dman.run_fg) as launch:
+            dman.down_with_volumes(p)
+        launch.assert_called_once_with(dman.compose_base(p) + ["down", "-v"], cwd=dman.compose_cwd(p))
         p = self.project()
         self.assertEqual(p.status, "not deployed")
         self.assertNotIn(self.name + "_data", dman.docker("volume", "ls", "-q").out.split())
